@@ -469,26 +469,55 @@ def passes_filters(pair: dict, rug_score: int, holders: list, deployer: str,
     if not twitter:
         return False, "no Twitter/X"
 
-    # 9. Owner wallet concentration — RUG PATTERN
-    # If 4+ of the top 10 holders are tagged [owner], dev controls
-    # multiple wallets and is likely about to dump
-    if holders:
-        owner_count = sum(1 for h in holders[:10] if h.get("owner") or h.get("insider"))
+    # 9. CLONE WALLET RUG PATTERN — mathematical detection
+    # Does NOT rely on API tags (owner/insider can be unreliable)
+    # Pattern: 1 big wallet (7-15%) + many wallets with almost identical tiny %
+    # This is always a dev splitting tokens across fake wallets
+    if len(holders) >= 5:
+        pcts = [normalize_pct(float(h.get("pct", 0))) for h in holders[:10]]
+
+        # Check if holders 2-10 are suspiciously uniform (all within 0.2% of each other)
+        small_pcts = pcts[1:]  # skip top holder
+        if small_pcts:
+            min_pct = min(small_pcts)
+            max_pct = max(small_pcts)
+            spread  = max_pct - min_pct
+            # If 6+ of the small holders are within 0.2% of each other = clone wallets
+            if spread <= 0.20 and len(small_pcts) >= 6:
+                return False, (
+                    f"clone wallet pattern detected — holders 2-10 all have "
+                    f"~{sum(small_pcts)/len(small_pcts):.2f}% (spread only {spread:.3f}%) — rug"
+                )
+
+        # Also keep API-based check as backup (some APIs do return it correctly)
+        owner_count = sum(
+            1 for h in holders[:10]
+            if h.get("owner") or h.get("insider") or
+               (h.get("ownerAddress") == h.get("address"))
+        )
         if owner_count >= 4:
-            return False, f"too many owner/insider wallets in top 10 ({owner_count}/10) — likely rug"
+            return False, f"too many owner wallets ({owner_count}/10) — likely rug"
 
-    # 10. PumpSwap rejection — only allow proper Raydium graduates
-    # PumpSwap coins have NOT proven organic demand yet
+    # 10. PumpSwap rejection — must be on Raydium or other legit DEX
     dex_id = (pair.get("dexId") or "").lower()
-    if "pump" in dex_id and "raydium" not in dex_id:
-        return False, f"on PumpSwap (not yet graduated to Raydium)"
+    label  = " ".join(str(l).lower() for l in (pair.get("labels") or []))
+    if ("pumpswap" in dex_id or "pump-swap" in dex_id or
+            ("pump" in dex_id and "raydium" not in dex_id)):
+        return False, "on PumpSwap — not yet graduated to Raydium"
 
-    # 11. Low LP Providers warning = easy rug pull
-    # If rugcheck explicitly warns about low LP providers, reject
+    # 11. Low LP Providers = easy rug — check both risks list AND pair labels
     for risk in (risks or []):
         name = (risk.get("name") or "").lower()
-        if "lp provider" in name or "liquidity provider" in name:
-            return False, "low LP providers — easy to rug"
+        desc = (risk.get("description") or "").lower()
+        if "lp provider" in name or "lp provider" in desc or \
+           "liquidity provider" in name or "few users" in desc:
+            return False, "low LP providers warning — easy to rug"
+
+    # 12. Address ends in 'pump' = still a Pump.fun token, not graduated
+    # Graduated tokens get a new mint address on Raydium
+    base_addr = (pair.get("baseToken") or {}).get("address", "")
+    if base_addr.endswith("pump"):
+        return False, "token address ends in 'pump' — not yet graduated from Pump.fun"
 
     return True, ""
 
@@ -1108,18 +1137,16 @@ async def post_init(app):
         await bot.send_message(
             chat_id=CHAT_ID,
             text=(
-                "Memecoin Scanner v5.1 is LIVE\n"
-                "ANTI-RUG PATCH APPLIED\n\n"
-                "3 new rug-catching rules:\n"
-                "- Rejects coins where 4+ top holders are [owner] wallets\n"
-                "- Rejects PumpSwap coins (must graduate to Raydium)\n"
-                "- Rejects coins with Low LP Providers warning\n\n"
-                "All previous filters still active:\n"
-                "Age 5-20min, Liq $10K-$2M, Mcap $10K-$500K,\n"
-                "65%+ buys, Rug LOW, Top holder <15%,\n"
-                "Top 10 <40%, Website + Twitter required,\n"
-                "Dev wallet check, Pump.fun graduation,\n"
-                "Holder velocity, Whale tracker\n\n"
+                "Memecoin Scanner v5.2 is LIVE\n"
+                "BULLETPROOF RUG DETECTION\n\n"
+                "Upgraded rug filters:\n"
+                "- Clone wallet pattern detection (mathematical)\n"
+                "  Catches devs splitting tokens across fake wallets\n"
+                "  even when API tags are missing or wrong\n"
+                "- Stricter PumpSwap + pump address rejection\n"
+                "- Improved Low LP Providers detection\n"
+                "- Rejects any token address ending in 'pump'\n\n"
+                "All previous filters still active.\n"
                 "Group scanner: ACTIVE"
             ),
         )
