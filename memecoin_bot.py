@@ -404,7 +404,7 @@ def record_whale_result(holders: list, whales: dict, won: bool):
 # ── Filter logic ──────────────────────────────────────────────────────────────
 
 def passes_filters(pair: dict, rug_score: int, holders: list, deployer: str,
-                   is_graduated: bool) -> tuple:
+                   is_graduated: bool, risks: list = None) -> tuple:
 
     # 1. Golden age window
     created_at = pair.get("pairCreatedAt", 0) or 0
@@ -468,6 +468,27 @@ def passes_filters(pair: dict, rug_score: int, holders: list, deployer: str,
         return False, "no website"
     if not twitter:
         return False, "no Twitter/X"
+
+    # 9. Owner wallet concentration — RUG PATTERN
+    # If 4+ of the top 10 holders are tagged [owner], dev controls
+    # multiple wallets and is likely about to dump
+    if holders:
+        owner_count = sum(1 for h in holders[:10] if h.get("owner") or h.get("insider"))
+        if owner_count >= 4:
+            return False, f"too many owner/insider wallets in top 10 ({owner_count}/10) — likely rug"
+
+    # 10. PumpSwap rejection — only allow proper Raydium graduates
+    # PumpSwap coins have NOT proven organic demand yet
+    dex_id = (pair.get("dexId") or "").lower()
+    if "pump" in dex_id and "raydium" not in dex_id:
+        return False, f"on PumpSwap (not yet graduated to Raydium)"
+
+    # 11. Low LP Providers warning = easy rug pull
+    # If rugcheck explicitly warns about low LP providers, reject
+    for risk in (risks or []):
+        name = (risk.get("name") or "").lower()
+        if "lp provider" in name or "liquidity provider" in name:
+            return False, "low LP providers — easy to rug"
 
     return True, ""
 
@@ -976,7 +997,7 @@ async def scanner_loop(bot: Bot, seen: set, session: aiohttp.ClientSession,
                 # Whale check
                 whale_found, whale_desc = check_known_whales(holders, whales)
 
-                passed, reason = passes_filters(pair, rug_score, holders, deployer, is_graduated)
+                passed, reason = passes_filters(pair, rug_score, holders, deployer, is_graduated, risks)
                 sym = (pair.get("baseToken") or {}).get("symbol", addr[:8])
 
                 if not passed:
@@ -1033,7 +1054,7 @@ def make_group_handler(seen: set, session: aiohttp.ClientSession, bot: Bot,
                 is_graduated  = await is_pumpfun_graduate(session, mint)
                 vel_score, vel_desc = check_holder_velocity(mint, len(holders))
                 whale_found, whale_desc = check_known_whales(holders, whales)
-                passed, reason = passes_filters(pair, rug_score, holders, deployer, is_graduated)
+                passed, reason = passes_filters(pair, rug_score, holders, deployer, is_graduated, risks)
                 sym = (pair.get("baseToken") or {}).get("symbol", query)
 
                 if not passed:
@@ -1087,19 +1108,18 @@ async def post_init(app):
         await bot.send_message(
             chat_id=CHAT_ID,
             text=(
-                "Memecoin Scanner v5 is LIVE\n"
-                "MAXIMUM WIN RATE EDITION\n\n"
-                "New features:\n"
-                "- Pump.fun graduation filter\n"
-                "- Holder growth velocity tracking\n"
-                "- Whale wallet tracker (learns over time)\n"
-                "- Dev wallet sell detection\n"
-                "- Price follow-up alerts (+50% pump / -30% dump)\n"
-                "- Daily summary every morning at 8am UTC\n\n"
+                "Memecoin Scanner v5.1 is LIVE\n"
+                "ANTI-RUG PATCH APPLIED\n\n"
+                "3 new rug-catching rules:\n"
+                "- Rejects coins where 4+ top holders are [owner] wallets\n"
+                "- Rejects PumpSwap coins (must graduate to Raydium)\n"
+                "- Rejects coins with Low LP Providers warning\n\n"
                 "All previous filters still active:\n"
                 "Age 5-20min, Liq $10K-$2M, Mcap $10K-$500K,\n"
                 "65%+ buys, Rug LOW, Top holder <15%,\n"
-                "Top 10 <40%, Website + Twitter required\n\n"
+                "Top 10 <40%, Website + Twitter required,\n"
+                "Dev wallet check, Pump.fun graduation,\n"
+                "Holder velocity, Whale tracker\n\n"
                 "Group scanner: ACTIVE"
             ),
         )
