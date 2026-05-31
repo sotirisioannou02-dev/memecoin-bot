@@ -825,49 +825,61 @@ async def daily_summary_loop(bot, portfolio, whales, session):
 # ── Auto scanner loop ─────────────────────────────────────────────────────────
 
 async def scanner_loop(bot, seen, session, portfolio, whales):
+    # alerted_set tracks coins we already SENT alerts for (never send twice)
+    # seen is only used for group handler deduplication now
+    alerted: set = set()
+
     while True:
         try:
             log.info("Scanning...")
             addresses = await get_all_latest_tokens(session)
+            log.info("Collected %d addresses.", len(addresses))
+
             for addr in addresses:
-                if addr in seen:
+                # Skip if we already sent an alert for this coin
+                if addr in alerted:
                     continue
 
                 pair = await get_pair_data(session, addr)
                 if not pair:
-                    seen.add(addr)
                     continue
 
                 created = pair.get("pairCreatedAt", 0) or 0
                 if not created:
-                    seen.add(addr)
                     continue
 
                 age_min = (int(time.time() * 1000) - created) / 60_000
 
+                # Log every coin with its age so we can see what's happening
+                sym = (pair.get("baseToken") or {}).get("symbol", addr[:8])
+                log.info("Checking %s — age: %.1fm", sym, age_min)
+
                 if age_min > MAX_AGE_MINUTES:
-                    seen.add(addr)
+                    log.info("Skip %s — too old (%.1fm)", sym, age_min)
                     continue
 
                 if age_min < MIN_AGE_MINUTES:
-                    # Too fresh — skip but do NOT add to seen
-                    # Bot will re-check on next scan
+                    log.info("Skip %s — too fresh (%.1fm)", sym, age_min)
                     continue
 
-                # In golden window — run full checks
-                seen.add(addr)
+                # In golden window — full evaluation
                 rug_score, risks, holders, deployer = await get_rugcheck(session, addr)
                 is_graduated     = await is_pumpfun_graduate(session, addr)
                 vel_score, vel_d = check_holder_velocity(addr, len(holders))
                 whale_f, whale_d = check_known_whales(holders, whales)
                 passed, reason   = passes_filters(pair, rug_score, holders, deployer, is_graduated, risks)
-                sym = (pair.get("baseToken") or {}).get("symbol", addr[:8])
+
                 if not passed:
                     log.info("Filtered: %s — %s", sym, reason)
                     continue
+
+                # Passed! Send alert and mark as alerted
+                alerted.add(addr)
+                seen.add(addr)
                 await send_alert(bot, pair, rug_score, risks, holders, "Auto-scan",
                                  is_graduated, vel_score, vel_d, whale_f, whale_d, portfolio, whales)
                 await asyncio.sleep(1)
+
         except Exception as e:
             log.error("Scanner error: %s", e)
         log.info("Sleeping %ds...", SCAN_INTERVAL)
