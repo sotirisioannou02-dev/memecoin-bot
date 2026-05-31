@@ -832,15 +832,30 @@ async def scanner_loop(bot, seen, session, portfolio, whales):
             for addr in addresses:
                 if addr in seen:
                     continue
-                seen.add(addr)
+
                 pair = await get_pair_data(session, addr)
                 if not pair:
+                    seen.add(addr)
                     continue
+
                 created = pair.get("pairCreatedAt", 0) or 0
-                if created:
-                    age_min = (int(time.time() * 1000) - created) / 60_000
-                    if age_min < MIN_AGE_MINUTES or age_min > MAX_AGE_MINUTES:
-                        continue
+                if not created:
+                    seen.add(addr)
+                    continue
+
+                age_min = (int(time.time() * 1000) - created) / 60_000
+
+                if age_min > MAX_AGE_MINUTES:
+                    seen.add(addr)
+                    continue
+
+                if age_min < MIN_AGE_MINUTES:
+                    # Too fresh — skip but do NOT add to seen
+                    # Bot will re-check on next scan
+                    continue
+
+                # In golden window — run full checks
+                seen.add(addr)
                 rug_score, risks, holders, deployer = await get_rugcheck(session, addr)
                 is_graduated     = await is_pumpfun_graduate(session, addr)
                 vel_score, vel_d = check_holder_velocity(addr, len(holders))
