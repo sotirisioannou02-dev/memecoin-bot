@@ -52,6 +52,11 @@ DEXSCREENER_BOOSTED = "https://api.dexscreener.com/token-boosts/latest/v1"
 DEXSCREENER_TOP     = "https://api.dexscreener.com/token-boosts/top/v1"
 DEXSCREENER_PAIRS   = "https://api.dexscreener.com/latest/dex/tokens/{address}"
 DEXSCREENER_SEARCH  = "https://api.dexscreener.com/latest/dex/search?q={query}"
+# New pairs endpoints — sorted by creation time, best for finding fresh coins
+DEXSCREENER_NEW_SOLANA = "https://api.dexscreener.com/latest/dex/pairs/solana?rankBy=pairAge&order=asc"
+DEXSCREENER_NEW_ETH    = "https://api.dexscreener.com/latest/dex/pairs/ethereum?rankBy=pairAge&order=asc"
+DEXSCREENER_NEW_BSC    = "https://api.dexscreener.com/latest/dex/pairs/bsc?rankBy=pairAge&order=asc"
+DEXSCREENER_NEW_BASE   = "https://api.dexscreener.com/latest/dex/pairs/base?rankBy=pairAge&order=asc"
 RUGCHECK_SUMMARY    = "https://api.rugcheck.xyz/v1/tokens/{mint}/report/summary"
 RUGCHECK_FULL       = "https://api.rugcheck.xyz/v1/tokens/{mint}/report"
 
@@ -238,16 +243,36 @@ async def fetch_json(session, url: str):
     return None
 
 async def get_all_latest_tokens(session) -> list:
+    """
+    Fetch fresh token addresses using multiple strategies:
+    1. New pairs endpoints (sorted by age ascending = newest first)
+    2. Latest token profiles (boosted/trending as fallback)
+    """
     addresses = []
-    for url in [DEXSCREENER_LATEST, DEXSCREENER_BOOSTED, DEXSCREENER_TOP]:
+
+    # Strategy 1: New pairs sorted by creation time (best source)
+    for url in [DEXSCREENER_NEW_SOLANA, DEXSCREENER_NEW_ETH,
+                DEXSCREENER_NEW_BSC, DEXSCREENER_NEW_BASE]:
+        data = await fetch_json(session, url)
+        if data:
+            pairs = data.get("pairs") or []
+            for pair in pairs[:50]:  # take top 50 newest
+                addr = (pair.get("baseToken") or {}).get("address", "")
+                if addr:
+                    addresses.append(addr)
+
+    # Strategy 2: Token profiles (boosted/latest as secondary source)
+    for url in [DEXSCREENER_LATEST, DEXSCREENER_BOOSTED]:
         data = await fetch_json(session, url)
         if isinstance(data, list):
             for item in data:
                 addr = item.get("tokenAddress") or item.get("address") or ""
                 if addr:
                     addresses.append(addr)
-    log.info("Collected %d addresses.", len(addresses))
-    return list(set(addresses))
+
+    unique = list(set(addresses))
+    log.info("Collected %d unique addresses from all feeds.", len(unique))
+    return unique
 
 async def get_pair_data(session, address: str):
     data = await fetch_json(session, DEXSCREENER_PAIRS.format(address=address))
