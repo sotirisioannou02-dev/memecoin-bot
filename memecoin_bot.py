@@ -242,44 +242,75 @@ async def fetch_json(session, url: str):
         log.warning("fetch error %s: %s", url[:60], e)
     return None
 
+async def get_new_pairs_from_dexscreener(session) -> list:
+    """
+    Fetch genuinely new pairs from DexScreener by searching
+    for recent Raydium listings. Uses multiple search terms
+    to catch coins across different themes.
+    """
+    addresses = []
+    now_ms = int(time.time() * 1000)
+    max_age_ms = MAX_AGE_MINUTES * 60 * 1000
+
+    # Search DexScreener for new Raydium pairs
+    # The key is to look at the pairCreatedAt field
+    search_urls = [
+        "https://api.dexscreener.com/latest/dex/pairs/solana/raydium",
+        "https://api.dexscreener.com/latest/dex/search?q=solana+new",
+        "https://api.dexscreener.com/latest/dex/search?q=pump+solana",
+    ]
+
+    for url in search_urls:
+        try:
+            data = await fetch_json(session, url)
+            if not data:
+                continue
+            pairs = data.get("pairs") or []
+            for pair in pairs:
+                created = pair.get("pairCreatedAt", 0) or 0
+                if not created:
+                    continue
+                age_ms = now_ms - created
+                # Only collect coins within our age range
+                if age_ms <= max_age_ms:
+                    addr = (pair.get("baseToken") or {}).get("address", "")
+                    if addr:
+                        addresses.append(addr)
+                        sym = (pair.get("baseToken") or {}).get("symbol", "???")
+                        age_min = age_ms / 60_000
+                        log.info("Found fresh coin: %s (%.1fm old)", sym, age_min)
+        except Exception as e:
+            log.warning("DexScreener search error: %s", e)
+
+    return list(set(addresses))
+
+
 async def get_all_latest_tokens(session) -> list:
     """
-    Fetch fresh token addresses from Pump.fun directly.
-    Pump.fun is the source of all new Solana memecoins.
-    We check both graduating coins (just moved to Raydium) 
-    and brand new launches.
+    Multi-strategy fresh coin discovery.
+    Combines DexScreener new pairs with token profile feeds.
     """
     addresses = []
 
-    # Strategy 1: Pump.fun recently graduated coins
-    # These just moved from Pump.fun bonding curve to Raydium
-    try:
-        data = await fetch_json(session, PUMPFUN_GRADUATING)
-        if isinstance(data, list):
-            for coin in data:
-                addr = coin.get("mint", "")
-                if addr:
-                    addresses.append(addr)
-                    log.debug("Graduated: %s", coin.get("symbol", addr[:8]))
-        log.info("Pump.fun graduated: %d coins", len(addresses))
-    except Exception as e:
-        log.warning("Pump.fun graduated error: %s", e)
+    # Strategy 1: Search specifically for new pairs in age window
+    fresh = await get_new_pairs_from_dexscreener(session)
+    addresses.extend(fresh)
+    log.info("Fresh pairs found: %d", len(fresh))
 
-    # Strategy 2: Pump.fun newest coins
-    try:
-        before = len(addresses)
-        data = await fetch_json(session, PUMPFUN_NEW)
+    # Strategy 2: Token profiles (some may be new)
+    for url in [
+        "https://api.dexscreener.com/token-profiles/latest/v1",
+        "https://api.dexscreener.com/token-boosts/latest/v1",
+    ]:
+        data = await fetch_json(session, url)
         if isinstance(data, list):
-            for coin in data:
-                addr = coin.get("mint", "")
+            for item in data:
+                addr = item.get("tokenAddress") or item.get("address") or ""
                 if addr:
                     addresses.append(addr)
-        log.info("Pump.fun new: %d coins", len(addresses) - before)
-    except Exception as e:
-        log.warning("Pump.fun new error: %s", e)
 
     unique = list(set(addresses))
-    log.info("Total unique addresses: %d", len(unique))
+    log.info("Total unique addresses collected: %d", len(unique))
     return unique
 
 async def get_pair_data(session, address: str):
