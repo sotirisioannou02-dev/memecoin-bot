@@ -47,16 +47,16 @@ SEEN_FILE      = "seen_tokens.json"
 WHALE_FILE     = "whale_wallets.json"
 PORTFOLIO_FILE = "portfolio.json"
 
-DEXSCREENER_LATEST  = "https://api.dexscreener.com/token-profiles/latest/v1"
-DEXSCREENER_BOOSTED = "https://api.dexscreener.com/token-boosts/latest/v1"
-DEXSCREENER_TOP     = "https://api.dexscreener.com/token-boosts/top/v1"
-DEXSCREENER_PAIRS   = "https://api.dexscreener.com/latest/dex/tokens/{address}"
-DEXSCREENER_SEARCH  = "https://api.dexscreener.com/latest/dex/search?q={query}"
-# New pairs endpoints — sorted by creation time, best for finding fresh coins
-DEXSCREENER_NEW_SOLANA = "https://api.dexscreener.com/latest/dex/pairs/solana?rankBy=pairAge&order=asc"
-DEXSCREENER_NEW_ETH    = "https://api.dexscreener.com/latest/dex/pairs/ethereum?rankBy=pairAge&order=asc"
-DEXSCREENER_NEW_BSC    = "https://api.dexscreener.com/latest/dex/pairs/bsc?rankBy=pairAge&order=asc"
-DEXSCREENER_NEW_BASE   = "https://api.dexscreener.com/latest/dex/pairs/base?rankBy=pairAge&order=asc"
+DEXSCREENER_PAIRS  = "https://api.dexscreener.com/latest/dex/tokens/{address}"
+DEXSCREENER_SEARCH = "https://api.dexscreener.com/latest/dex/search?q={query}"
+
+# Pump.fun graduated tokens — coins that just moved from Pump.fun to Raydium
+# These are genuinely new (last few hours) and have proven organic demand
+PUMPFUN_GRADUATING = "https://frontend-api.pump.fun/coins/recently-graduated?offset=0&limit=50&includeNsfw=false"
+PUMPFUN_NEW        = "https://frontend-api.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=DESC&includeNsfw=false"
+
+# DexScreener search for very new Raydium pairs
+DEXSCREENER_NEW_RAYDIUM = "https://api.dexscreener.com/latest/dex/pairs/solana/raydium"
 RUGCHECK_SUMMARY    = "https://api.rugcheck.xyz/v1/tokens/{mint}/report/summary"
 RUGCHECK_FULL       = "https://api.rugcheck.xyz/v1/tokens/{mint}/report"
 
@@ -244,34 +244,42 @@ async def fetch_json(session, url: str):
 
 async def get_all_latest_tokens(session) -> list:
     """
-    Fetch fresh token addresses using multiple strategies:
-    1. New pairs endpoints (sorted by age ascending = newest first)
-    2. Latest token profiles (boosted/trending as fallback)
+    Fetch fresh token addresses from Pump.fun directly.
+    Pump.fun is the source of all new Solana memecoins.
+    We check both graduating coins (just moved to Raydium) 
+    and brand new launches.
     """
     addresses = []
 
-    # Strategy 1: New pairs sorted by creation time (best source)
-    for url in [DEXSCREENER_NEW_SOLANA, DEXSCREENER_NEW_ETH,
-                DEXSCREENER_NEW_BSC, DEXSCREENER_NEW_BASE]:
-        data = await fetch_json(session, url)
-        if data:
-            pairs = data.get("pairs") or []
-            for pair in pairs[:50]:  # take top 50 newest
-                addr = (pair.get("baseToken") or {}).get("address", "")
-                if addr:
-                    addresses.append(addr)
-
-    # Strategy 2: Token profiles (boosted/latest as secondary source)
-    for url in [DEXSCREENER_LATEST, DEXSCREENER_BOOSTED]:
-        data = await fetch_json(session, url)
+    # Strategy 1: Pump.fun recently graduated coins
+    # These just moved from Pump.fun bonding curve to Raydium
+    try:
+        data = await fetch_json(session, PUMPFUN_GRADUATING)
         if isinstance(data, list):
-            for item in data:
-                addr = item.get("tokenAddress") or item.get("address") or ""
+            for coin in data:
+                addr = coin.get("mint", "")
                 if addr:
                     addresses.append(addr)
+                    log.debug("Graduated: %s", coin.get("symbol", addr[:8]))
+        log.info("Pump.fun graduated: %d coins", len(addresses))
+    except Exception as e:
+        log.warning("Pump.fun graduated error: %s", e)
+
+    # Strategy 2: Pump.fun newest coins
+    try:
+        before = len(addresses)
+        data = await fetch_json(session, PUMPFUN_NEW)
+        if isinstance(data, list):
+            for coin in data:
+                addr = coin.get("mint", "")
+                if addr:
+                    addresses.append(addr)
+        log.info("Pump.fun new: %d coins", len(addresses) - before)
+    except Exception as e:
+        log.warning("Pump.fun new error: %s", e)
 
     unique = list(set(addresses))
-    log.info("Collected %d unique addresses from all feeds.", len(unique))
+    log.info("Total unique addresses: %d", len(unique))
     return unique
 
 async def get_pair_data(session, address: str):
