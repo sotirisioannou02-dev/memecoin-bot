@@ -143,10 +143,17 @@ async def save_all_to_cloud(session: aiohttp.ClientSession, seen: set, whales: d
             log.warning("Local save error %s: %s", path, e)
 
 async def backup_loop(session: aiohttp.ClientSession, seen: set, whales: dict, portfolio: list):
-    """Auto-backup to cloud every 5 minutes."""
+    """Auto-backup to cloud every 5 minutes. Caps seen list at 1000 to prevent bloat."""
     while True:
         await asyncio.sleep(BACKUP_INTERVAL)
         log.info("Auto-backup to Supabase...")
+        # Cap seen list at 1000 most recent — prevents it growing forever
+        # and ensures Supabase clear actually takes effect on restart
+        if len(seen) > 1000:
+            seen_list = list(seen)
+            seen.clear()
+            seen.update(seen_list[-1000:])
+            log.info("Capped seen list to 1000 items.")
         await save_all_to_cloud(session, seen, whales, portfolio)
 
 
@@ -771,7 +778,7 @@ async def daily_summary_loop(bot, portfolio, whales, session):
         now_utc  = datetime.now(timezone.utc)
         next_8am = now_utc.replace(hour=DAILY_SUMMARY_HOUR, minute=0, second=0, microsecond=0)
         if now_utc >= next_8am:
-            next_8am = next_8am.replace(day=next_8am.day + 1)
+            from datetime import timedelta; next_8am = next_8am + timedelta(days=1)
         await asyncio.sleep((next_8am - now_utc).total_seconds())
         try:
             today_start = int(time.time()) - 86400
