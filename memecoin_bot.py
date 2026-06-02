@@ -27,6 +27,11 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY","eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.ey
 SUPABASE_TABLE   = "bot_memory"
 BACKUP_INTERVAL  = 300   # save to cloud every 5 min
 
+# Helius API — real-time Solana blockchain data
+HELIUS_API_KEY   = "8fdbbc24-7fc5-4d65-a454-90f015afa71e"
+HELIUS_RPC       = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+HELIUS_API       = f"https://api.helius.xyz/v0"
+
 SCAN_INTERVAL    = 60
 MIN_LIQUIDITY    = 7_500
 MAX_LIQUIDITY    = 2_000_000
@@ -242,76 +247,124 @@ async def fetch_json(session, url: str):
         log.warning("fetch error %s: %s", url[:60], e)
     return None
 
-async def get_fresh_from_geckoterminal(session) -> list:
+async def get_fresh_from_helius(session) -> list:
     """
-    GeckoTerminal free API — new Solana pools sorted by creation time.
-    Returns genuinely fresh pairs from the last 30 minutes.
+    Helius API — get newly created Solana tokens in real time.
+    Uses Helius token metadata API to find brand new mints.
+    This is the most accurate and fastest source available.
     """
     addresses = []
-    now_ms    = int(time.time() * 1000)
-    max_age_ms = MAX_AGE_MINUTES * 60 * 1000
+    now_s     = int(time.time())
+    max_age_s = MAX_AGE_MINUTES * 60
 
-    urls = [
-        "https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=1",
-        "https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=2",
-        "https://api.geckoterminal.com/api/v2/networks/solana/trending_pools?page=1",
-    ]
-
-    for url in urls:
-        try:
-            async with session.get(url,
-                headers={"Accept": "application/json"},
-                timeout=aiohttp.ClientTimeout(total=15)) as r:
-                if r.status != 200:
-                    continue
+    try:
+        # Get signatures for recent transactions on Raydium AMM
+        # This catches every new pool creation in real time
+        raydium_amm = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp"
+        url = f"{HELIUS_RPC}"
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": [
+                raydium_amm,
+                {"limit": 100, "commitment": "confirmed"}
+            ]
+        }
+        async with session.post(url, json=payload,
+            timeout=aiohttp.ClientTimeout(total=15)) as r:
+            if r.status == 200:
                 data = await r.json()
-                pools = (data.get("data") or [])
-                for pool in pools:
-                    attrs = pool.get("attributes") or {}
-                    created_str = attrs.get("pool_created_at") or ""
-                    addr = attrs.get("base_token_address") or ""
-                    if not addr or not created_str:
-                        continue
-                    try:
-                        from datetime import datetime, timezone
-                        created_dt = datetime.fromisoformat(
-                            created_str.replace("Z", "+00:00"))
-                        now_dt = datetime.now(timezone.utc)
-                        age_min = (now_dt - created_dt).total_seconds() / 60
-                        if 0 <= age_min <= MAX_AGE_MINUTES:
-                            addresses.append(addr)
-                            name = attrs.get("name", addr[:8])
-                            log.info("GeckoTerminal fresh: %s (%.1fm)", name, age_min)
-                    except Exception:
-                        pass
-        except Exception as e:
-            log.warning("GeckoTerminal error: %s", e)
+                sigs = [s["signature"] for s in (data.get("result") or [])
+                        if not s.get("err")]
+                log.info("Helius: got %d recent Raydium signatures", len(sigs))
 
-    log.info("GeckoTerminal fresh coins: %d", len(addresses))
+                # Parse transactions to extract new token mints
+                if sigs:
+                    tx_payload = {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "getTransactions",
+                        "params": [sigs[:20], {"commitment": "confirmed",
+                                               "maxSupportedTransactionVersion": 0}]
+                    }
+                    async with session.post(url, json=tx_payload,
+                        timeout=aiohttp.ClientTimeout(total=20)) as tr:
+                        if tr.status == 200:
+                            txs = (await tr.json()).get("result") or []
+                            for tx in txs:
+                                if not tx:
+                                    continue
+                                block_time = tx.get("blockTime", 0) or 0
+                                age_s = now_s - block_time
+                                if 0 <= age_s <= max_age_s:
+                                    # Extract token accounts from transaction
+                                    meta = tx.get("meta") or {}
+                                    post_balances = meta.get("postTokenBalances") or []
+                                    for bal in post_balances:
+                                        mint = bal.get("mint", "")
+                                        if mint and mint not in addresses:
+                                            addresses.append(mint)
+                                            log.info("Helius new token: %s (%.1fs old)",
+                                                     mint[:8], age_s)
+
+    except Exception as e:
+        log.warning("Helius RPC error: %s", e)
+
+    log.info("Helius fresh tokens: %d", len(addresses))
+    return addresses
+
+
+async def get_fresh_from_helius_enhanced(session) -> list:
+    """
+    Helius Enhanced Transactions API — parse new pool creations.
+    More accurate than raw RPC for finding new token launches.
+    """
+    addresses = []
+    now_s     = int(time.time())
+    max_age_s = MAX_AGE_MINUTES * 60
+
+    try:
+        # Use Helius parsed transaction history on Raydium
+        raydium_amm = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp"
+        url = f"{HELIUS_API}/addresses/{raydium_amm}/transactions?api-key={HELIUS_API_KEY}&limit=100&type=SWAP"
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
+            if r.status == 200:
+                txs = await r.json()
+                for tx in (txs if isinstance(txs, list) else []):
+                    ts = tx.get("timestamp", 0) or 0
+                    age_s = now_s - ts
+                    if 0 <= age_s <= max_age_s:
+                        # Extract token transfers
+                        for transfer in (tx.get("tokenTransfers") or []):
+                            mint = transfer.get("mint", "")
+                            if mint and mint not in addresses:
+                                addresses.append(mint)
+                log.info("Helius enhanced: %d fresh tokens", len(addresses))
+    except Exception as e:
+        log.warning("Helius enhanced error: %s", e)
+
     return addresses
 
 
 async def get_fresh_from_dexscreener(session) -> list:
     """
-    DexScreener — pull Solana Raydium pairs and filter by age.
+    DexScreener — backup source for fresh pairs.
     """
     addresses = []
     now_ms    = int(time.time() * 1000)
     max_age_ms = MAX_AGE_MINUTES * 60 * 1000
 
-    urls = [
+    for url in [
         "https://api.dexscreener.com/latest/dex/pairs/solana/raydium",
         "https://api.dexscreener.com/latest/dex/pairs/solana/orca",
         "https://api.dexscreener.com/latest/dex/pairs/solana/meteora",
-    ]
-
-    for url in urls:
+    ]:
         try:
             data = await fetch_json(session, url)
             if not data:
                 continue
-            pairs = data.get("pairs") or []
-            for pair in pairs:
+            for pair in (data.get("pairs") or []):
                 created = pair.get("pairCreatedAt", 0) or 0
                 if not created:
                     continue
@@ -323,42 +376,66 @@ async def get_fresh_from_dexscreener(session) -> list:
                         addresses.append(addr)
                         log.info("DexScreener fresh: %s (%.1fm)", sym, age_ms/60_000)
         except Exception as e:
-            log.warning("DexScreener pairs error: %s", e)
+            log.warning("DexScreener error: %s", e)
 
-    log.info("DexScreener fresh coins: %d", len(addresses))
+    return list(set(addresses))
+
+
+async def get_fresh_from_geckoterminal(session) -> list:
+    """GeckoTerminal — additional backup source."""
+    addresses = []
+    for url in [
+        "https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=1",
+        "https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=2",
+    ]:
+        try:
+            async with session.get(url, headers={"Accept": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=15)) as r:
+                if r.status != 200:
+                    continue
+                data = await r.json()
+                for pool in (data.get("data") or []):
+                    attrs       = pool.get("attributes") or {}
+                    created_str = attrs.get("pool_created_at") or ""
+                    addr        = attrs.get("base_token_address") or ""
+                    if not addr or not created_str:
+                        continue
+                    try:
+                        created_dt = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
+                        age_min    = (datetime.now(timezone.utc) - created_dt).total_seconds() / 60
+                        if 0 <= age_min <= MAX_AGE_MINUTES:
+                            addresses.append(addr)
+                            log.info("GeckoTerminal fresh: %s (%.1fm)",
+                                     attrs.get("name", addr[:8]), age_min)
+                    except Exception:
+                        pass
+        except Exception as e:
+            log.warning("GeckoTerminal error: %s", e)
     return addresses
 
 
 async def get_all_latest_tokens(session) -> list:
     """
-    Multi-source fresh coin discovery.
-    GeckoTerminal + DexScreener Raydium/Orca/Meteora + token profiles.
+    Multi-source parallel fresh coin discovery.
+    Helius (primary) + DexScreener + GeckoTerminal (backups).
     """
-    # Run all sources in parallel for speed
-    gecko_task = asyncio.create_task(get_fresh_from_geckoterminal(session))
-    dex_task   = asyncio.create_task(get_fresh_from_dexscreener(session))
+    helius_task  = asyncio.create_task(get_fresh_from_helius(session))
+    helius2_task = asyncio.create_task(get_fresh_from_helius_enhanced(session))
+    dex_task     = asyncio.create_task(get_fresh_from_dexscreener(session))
+    gecko_task   = asyncio.create_task(get_fresh_from_geckoterminal(session))
 
-    gecko_addrs, dex_addrs = await asyncio.gather(gecko_task, dex_task)
+    results = await asyncio.gather(
+        helius_task, helius2_task, dex_task, gecko_task,
+        return_exceptions=True
+    )
 
-    addresses = gecko_addrs + dex_addrs
-
-    # Also pull token profiles as fallback
-    for url in [
-        "https://api.dexscreener.com/token-profiles/latest/v1",
-        "https://api.dexscreener.com/token-boosts/latest/v1",
-    ]:
-        try:
-            data = await fetch_json(session, url)
-            if isinstance(data, list):
-                for item in data:
-                    addr = item.get("tokenAddress") or item.get("address") or ""
-                    if addr:
-                        addresses.append(addr)
-        except Exception as e:
-            log.warning("Profile feed error: %s", e)
+    addresses = []
+    for r in results:
+        if isinstance(r, list):
+            addresses.extend(r)
 
     unique = list(set(addresses))
-    log.info("Total unique addresses this scan: %d", len(unique))
+    log.info("Total unique fresh addresses: %d", len(unique))
     return unique
 
 async def get_pair_data(session, address: str):
