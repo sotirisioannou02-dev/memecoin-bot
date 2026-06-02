@@ -28,10 +28,10 @@ SUPABASE_TABLE   = "bot_memory"
 BACKUP_INTERVAL  = 300   # save to cloud every 5 min
 
 SCAN_INTERVAL    = 60
-MIN_LIQUIDITY    = 10_000
+MIN_LIQUIDITY    = 7_500
 MAX_LIQUIDITY    = 2_000_000
-MIN_AGE_MINUTES  = 5
-MAX_AGE_MINUTES  = 20
+MIN_AGE_MINUTES  = 3
+MAX_AGE_MINUTES  = 30
 MAX_TOP_HOLDER   = 15.0
 MAX_TOP10        = 40.0
 MIN_BUY_PRESSURE = 65.0
@@ -242,25 +242,70 @@ async def fetch_json(session, url: str):
         log.warning("fetch error %s: %s", url[:60], e)
     return None
 
-async def get_new_pairs_from_dexscreener(session) -> list:
+async def get_fresh_from_geckoterminal(session) -> list:
     """
-    Fetch genuinely new pairs from DexScreener by searching
-    for recent Raydium listings. Uses multiple search terms
-    to catch coins across different themes.
+    GeckoTerminal free API — new Solana pools sorted by creation time.
+    Returns genuinely fresh pairs from the last 30 minutes.
     """
     addresses = []
-    now_ms = int(time.time() * 1000)
+    now_ms    = int(time.time() * 1000)
     max_age_ms = MAX_AGE_MINUTES * 60 * 1000
 
-    # Search DexScreener for new Raydium pairs
-    # The key is to look at the pairCreatedAt field
-    search_urls = [
-        "https://api.dexscreener.com/latest/dex/pairs/solana/raydium",
-        "https://api.dexscreener.com/latest/dex/search?q=solana+new",
-        "https://api.dexscreener.com/latest/dex/search?q=pump+solana",
+    urls = [
+        "https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=1",
+        "https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=2",
+        "https://api.geckoterminal.com/api/v2/networks/solana/trending_pools?page=1",
     ]
 
-    for url in search_urls:
+    for url in urls:
+        try:
+            async with session.get(url,
+                headers={"Accept": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=15)) as r:
+                if r.status != 200:
+                    continue
+                data = await r.json()
+                pools = (data.get("data") or [])
+                for pool in pools:
+                    attrs = pool.get("attributes") or {}
+                    created_str = attrs.get("pool_created_at") or ""
+                    addr = attrs.get("base_token_address") or ""
+                    if not addr or not created_str:
+                        continue
+                    try:
+                        from datetime import datetime, timezone
+                        created_dt = datetime.fromisoformat(
+                            created_str.replace("Z", "+00:00"))
+                        now_dt = datetime.now(timezone.utc)
+                        age_min = (now_dt - created_dt).total_seconds() / 60
+                        if 0 <= age_min <= MAX_AGE_MINUTES:
+                            addresses.append(addr)
+                            name = attrs.get("name", addr[:8])
+                            log.info("GeckoTerminal fresh: %s (%.1fm)", name, age_min)
+                    except Exception:
+                        pass
+        except Exception as e:
+            log.warning("GeckoTerminal error: %s", e)
+
+    log.info("GeckoTerminal fresh coins: %d", len(addresses))
+    return addresses
+
+
+async def get_fresh_from_dexscreener(session) -> list:
+    """
+    DexScreener — pull Solana Raydium pairs and filter by age.
+    """
+    addresses = []
+    now_ms    = int(time.time() * 1000)
+    max_age_ms = MAX_AGE_MINUTES * 60 * 1000
+
+    urls = [
+        "https://api.dexscreener.com/latest/dex/pairs/solana/raydium",
+        "https://api.dexscreener.com/latest/dex/pairs/solana/orca",
+        "https://api.dexscreener.com/latest/dex/pairs/solana/meteora",
+    ]
+
+    for url in urls:
         try:
             data = await fetch_json(session, url)
             if not data:
@@ -271,46 +316,49 @@ async def get_new_pairs_from_dexscreener(session) -> list:
                 if not created:
                     continue
                 age_ms = now_ms - created
-                # Only collect coins within our age range
-                if age_ms <= max_age_ms:
+                if 0 <= age_ms <= max_age_ms:
                     addr = (pair.get("baseToken") or {}).get("address", "")
+                    sym  = (pair.get("baseToken") or {}).get("symbol", "???")
                     if addr:
                         addresses.append(addr)
-                        sym = (pair.get("baseToken") or {}).get("symbol", "???")
-                        age_min = age_ms / 60_000
-                        log.info("Found fresh coin: %s (%.1fm old)", sym, age_min)
+                        log.info("DexScreener fresh: %s (%.1fm)", sym, age_ms/60_000)
         except Exception as e:
-            log.warning("DexScreener search error: %s", e)
+            log.warning("DexScreener pairs error: %s", e)
 
-    return list(set(addresses))
+    log.info("DexScreener fresh coins: %d", len(addresses))
+    return addresses
 
 
 async def get_all_latest_tokens(session) -> list:
     """
-    Multi-strategy fresh coin discovery.
-    Combines DexScreener new pairs with token profile feeds.
+    Multi-source fresh coin discovery.
+    GeckoTerminal + DexScreener Raydium/Orca/Meteora + token profiles.
     """
-    addresses = []
+    # Run all sources in parallel for speed
+    gecko_task = asyncio.create_task(get_fresh_from_geckoterminal(session))
+    dex_task   = asyncio.create_task(get_fresh_from_dexscreener(session))
 
-    # Strategy 1: Search specifically for new pairs in age window
-    fresh = await get_new_pairs_from_dexscreener(session)
-    addresses.extend(fresh)
-    log.info("Fresh pairs found: %d", len(fresh))
+    gecko_addrs, dex_addrs = await asyncio.gather(gecko_task, dex_task)
 
-    # Strategy 2: Token profiles (some may be new)
+    addresses = gecko_addrs + dex_addrs
+
+    # Also pull token profiles as fallback
     for url in [
         "https://api.dexscreener.com/token-profiles/latest/v1",
         "https://api.dexscreener.com/token-boosts/latest/v1",
     ]:
-        data = await fetch_json(session, url)
-        if isinstance(data, list):
-            for item in data:
-                addr = item.get("tokenAddress") or item.get("address") or ""
-                if addr:
-                    addresses.append(addr)
+        try:
+            data = await fetch_json(session, url)
+            if isinstance(data, list):
+                for item in data:
+                    addr = item.get("tokenAddress") or item.get("address") or ""
+                    if addr:
+                        addresses.append(addr)
+        except Exception as e:
+            log.warning("Profile feed error: %s", e)
 
     unique = list(set(addresses))
-    log.info("Total unique addresses collected: %d", len(unique))
+    log.info("Total unique addresses this scan: %d", len(unique))
     return unique
 
 async def get_pair_data(session, address: str):
