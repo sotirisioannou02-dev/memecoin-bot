@@ -1209,16 +1209,17 @@ async def post_init(app):
     ))
     try:
         await bot.send_message(chat_id=CHAT_ID, text=(
-            "Memecoin Scanner v5.3 is LIVE\n"
-            "PERMANENT CLOUD MEMORY EDITION\n\n"
-            "Memory saved to Supabase cloud:\n"
-            "- Seen tokens: never alerts same coin twice\n"
-            "- Whale wallets: learning your winners\n"
-            "- Portfolio: tracking price follow-ups\n"
-            "- Auto-backup every 5 minutes\n"
-            "- Survives Railway restarts\n\n"
-            "All filters active + bulletproof rug detection.\n"
-            "Group scanner: ACTIVE"
+            "Memecoin Scanner v5.4 is LIVE\n"
+            "HELIUS DEVELOPER EDITION\n\n"
+            "Powered by Helius Developer (10M credits/day)\n"
+            "Monitoring 3 DEX programs in parallel:\n"
+            "- Raydium AMM v4\n"
+            "- Raydium CPMM\n"
+            "- Pump.fun program\n\n"
+            "Finding coins under 2 minutes old!\n\n"
+            "All 12 filters active.\n"
+            "Cloud memory: Supabase ACTIVE.\n"
+            "Group scanner: ACTIVE."
         ))
     except TelegramError as e:
         log.error("Startup message failed: %s", e)
@@ -1246,7 +1247,7 @@ def main():
         .post_shutdown(post_shutdown)
         .build()
     )
-    log.info("Starting bot v5.3...")
+    log.info("Starting bot v5.4...")
     app.run_polling(allowed_updates=["message"])
 
 
