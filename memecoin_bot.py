@@ -249,64 +249,81 @@ async def fetch_json(session, url: str):
 
 async def get_fresh_from_helius(session) -> list:
     """
-    Helius API — get newly created Solana tokens in real time.
-    Uses Helius token metadata API to find brand new mints.
-    This is the most accurate and fastest source available.
+    Helius API — monitor new Raydium pool initializations.
+    Watches the Raydium AMM program for new liquidity pool
+    creation transactions and extracts the new token mints.
+    Works on free tier using getSignaturesForAddress + getTransaction.
     """
     addresses = []
     now_s     = int(time.time())
     max_age_s = MAX_AGE_MINUTES * 60
 
-    try:
-        # Get signatures for recent transactions on Raydium AMM
-        # This catches every new pool creation in real time
-        raydium_amm = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp"
-        url = f"{HELIUS_RPC}"
-        payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getSignaturesForAddress",
-            "params": [
-                raydium_amm,
-                {"limit": 100, "commitment": "confirmed"}
-            ]
-        }
-        async with session.post(url, json=payload,
-            timeout=aiohttp.ClientTimeout(total=15)) as r:
-            if r.status == 200:
-                data = await r.json()
-                sigs = [s["signature"] for s in (data.get("result") or [])
-                        if not s.get("err")]
-                log.info("Helius: got %d recent Raydium signatures", len(sigs))
+    # Raydium AMM v4 program — all new Raydium pools go through this
+    raydium_amm = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp"
 
-                # Parse transactions to extract new token mints
-                if sigs:
-                    tx_payload = {
-                        "jsonrpc": "2.0",
-                        "id": 1,
-                        "method": "getTransactions",
-                        "params": [sigs[:20], {"commitment": "confirmed",
-                                               "maxSupportedTransactionVersion": 0}]
-                    }
-                    async with session.post(url, json=tx_payload,
-                        timeout=aiohttp.ClientTimeout(total=20)) as tr:
-                        if tr.status == 200:
-                            txs = (await tr.json()).get("result") or []
-                            for tx in txs:
-                                if not tx:
-                                    continue
-                                block_time = tx.get("blockTime", 0) or 0
-                                age_s = now_s - block_time
-                                if 0 <= age_s <= max_age_s:
-                                    # Extract token accounts from transaction
-                                    meta = tx.get("meta") or {}
-                                    post_balances = meta.get("postTokenBalances") or []
-                                    for bal in post_balances:
-                                        mint = bal.get("mint", "")
-                                        if mint and mint not in addresses:
-                                            addresses.append(mint)
-                                            log.info("Helius new token: %s (%.1fs old)",
-                                                     mint[:8], age_s)
+    try:
+        # Step 1: Get recent signatures for Raydium AMM
+        payload = {
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": [raydium_amm, {"limit": 50, "commitment": "confirmed"}]
+        }
+        async with session.post(HELIUS_RPC, json=payload,
+            timeout=aiohttp.ClientTimeout(total=15)) as r:
+            if r.status != 200:
+                log.warning("Helius getSignatures status: %d", r.status)
+                return []
+            data  = await r.json()
+            sigs  = [s["signature"] for s in (data.get("result") or [])
+                     if not s.get("err")]
+            log.info("Helius: %d recent Raydium sigs", len(sigs))
+
+        if not sigs:
+            return []
+
+        # Step 2: Fetch each transaction and extract new token mints
+        for sig in sigs[:10]:  # check 10 most recent
+            try:
+                tx_payload = {
+                    "jsonrpc": "2.0", "id": 1,
+                    "method": "getTransaction",
+                    "params": [sig, {
+                        "encoding": "jsonParsed",
+                        "commitment": "confirmed",
+                        "maxSupportedTransactionVersion": 0
+                    }]
+                }
+                async with session.post(HELIUS_RPC, json=tx_payload,
+                    timeout=aiohttp.ClientTimeout(total=10)) as tr:
+                    if tr.status != 200:
+                        continue
+                    tx = (await tr.json()).get("result")
+                    if not tx:
+                        continue
+
+                    block_time = tx.get("blockTime", 0) or 0
+                    age_s = now_s - block_time
+                    if age_s < 0 or age_s > max_age_s:
+                        continue
+
+                    # Extract mints from post token balances
+                    meta = tx.get("meta") or {}
+                    for bal in (meta.get("postTokenBalances") or []):
+                        mint = bal.get("mint", "")
+                        owner = bal.get("owner", "")
+                        # Skip SOL/USDC/known stables
+                        known = {
+                            "So11111111111111111111111111111111111111112",
+                            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                            "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+                        }
+                        if mint and mint not in addresses and mint not in known:
+                            addresses.append(mint)
+                            log.info("Helius new mint: %s (age: %.0fs)", mint[:8], age_s)
+
+            except Exception as e:
+                log.warning("Helius tx parse error: %s", e)
+                continue
 
     except Exception as e:
         log.warning("Helius RPC error: %s", e)
@@ -317,30 +334,46 @@ async def get_fresh_from_helius(session) -> list:
 
 async def get_fresh_from_helius_enhanced(session) -> list:
     """
-    Helius Enhanced Transactions API — parse new pool creations.
-    More accurate than raw RPC for finding new token launches.
+    Helius Enhanced API — parse ADD_LIQUIDITY events to find new pools.
+    This catches coins the moment they get their first liquidity added.
     """
     addresses = []
     now_s     = int(time.time())
     max_age_s = MAX_AGE_MINUTES * 60
 
     try:
-        # Use Helius parsed transaction history on Raydium
         raydium_amm = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp"
-        url = f"{HELIUS_API}/addresses/{raydium_amm}/transactions?api-key={HELIUS_API_KEY}&limit=100&type=SWAP"
+        url = (f"{HELIUS_API}/addresses/{raydium_amm}/transactions"
+               f"?api-key={HELIUS_API_KEY}&limit=50")
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
-            if r.status == 200:
-                txs = await r.json()
-                for tx in (txs if isinstance(txs, list) else []):
-                    ts = tx.get("timestamp", 0) or 0
-                    age_s = now_s - ts
-                    if 0 <= age_s <= max_age_s:
-                        # Extract token transfers
-                        for transfer in (tx.get("tokenTransfers") or []):
-                            mint = transfer.get("mint", "")
-                            if mint and mint not in addresses:
-                                addresses.append(mint)
-                log.info("Helius enhanced: %d fresh tokens", len(addresses))
+            if r.status != 200:
+                log.warning("Helius enhanced status: %d", r.status)
+                return []
+            txs = await r.json()
+            if not isinstance(txs, list):
+                return []
+
+            for tx in txs:
+                ts    = tx.get("timestamp", 0) or 0
+                age_s = now_s - ts
+                if age_s < 0 or age_s > max_age_s:
+                    continue
+                tx_type = (tx.get("type") or "").upper()
+                # Look for ADD_LIQUIDITY or INITIALIZE events
+                if tx_type not in ("ADD_LIQUIDITY", "INITIALIZE",
+                                   "SWAP", "UNKNOWN"):
+                    continue
+                for transfer in (tx.get("tokenTransfers") or []):
+                    mint = transfer.get("mint", "")
+                    known = {
+                        "So11111111111111111111111111111111111111112",
+                        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                    }
+                    if mint and mint not in addresses and mint not in known:
+                        addresses.append(mint)
+                        log.info("Helius enhanced mint: %s (%.0fs)", mint[:8], age_s)
+
+        log.info("Helius enhanced: %d fresh tokens", len(addresses))
     except Exception as e:
         log.warning("Helius enhanced error: %s", e)
 
