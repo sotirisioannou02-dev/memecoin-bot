@@ -27,10 +27,24 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY","eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.ey
 SUPABASE_TABLE   = "bot_memory"
 BACKUP_INTERVAL  = 300   # save to cloud every 5 min
 
-# Helius API — real-time Solana blockchain data
+# Helius API — Developer Plan (10M credits, 50 req/s)
 HELIUS_API_KEY   = "8fdbbc24-7fc5-4d65-a454-90f015afa71e"
 HELIUS_RPC       = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
-HELIUS_API       = f"https://api.helius.xyz/v0"
+HELIUS_API       = "https://api.helius.xyz/v0"
+HELIUS_WS        = f"wss://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+
+# Raydium + Pump.fun program addresses
+RAYDIUM_AMM      = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp"
+RAYDIUM_CPMM     = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C"
+PUMPFUN_PROGRAM  = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+
+# Known stablecoins/base tokens to skip
+SKIP_MINTS = {
+    "So11111111111111111111111111111111111111112",   # SOL
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", # USDC
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", # USDT
+    "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",  # mSOL
+}
 
 SCAN_INTERVAL    = 60
 MIN_LIQUIDITY    = 7_500
@@ -249,134 +263,152 @@ async def fetch_json(session, url: str):
 
 async def get_fresh_from_helius(session) -> list:
     """
-    Helius API — monitor new Raydium pool initializations.
-    Watches the Raydium AMM program for new liquidity pool
-    creation transactions and extracts the new token mints.
-    Works on free tier using getSignaturesForAddress + getTransaction.
+    Helius Developer — fetch new token mints from Raydium + Pump.fun
+    using the Enhanced Transactions API (available on Developer plan).
+    Monitors multiple DEX programs simultaneously.
     """
     addresses = []
     now_s     = int(time.time())
     max_age_s = MAX_AGE_MINUTES * 60
 
-    # Raydium AMM v4 program — all new Raydium pools go through this
-    raydium_amm = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp"
+    programs = [
+        (RAYDIUM_AMM,  "Raydium AMM"),
+        (RAYDIUM_CPMM, "Raydium CPMM"),
+        (PUMPFUN_PROGRAM, "Pump.fun"),
+    ]
 
-    try:
-        # Step 1: Get recent signatures for Raydium AMM
-        payload = {
-            "jsonrpc": "2.0", "id": 1,
-            "method": "getSignaturesForAddress",
-            "params": [raydium_amm, {"limit": 50, "commitment": "confirmed"}]
-        }
-        async with session.post(HELIUS_RPC, json=payload,
-            timeout=aiohttp.ClientTimeout(total=15)) as r:
-            if r.status != 200:
-                log.warning("Helius getSignatures status: %d", r.status)
-                return []
-            data  = await r.json()
-            sigs  = [s["signature"] for s in (data.get("result") or [])
-                     if not s.get("err")]
-            log.info("Helius: %d recent Raydium sigs", len(sigs))
+    for program, name in programs:
+        try:
+            # Enhanced Transactions API — human readable, structured data
+            url = (f"{HELIUS_API}/addresses/{program}/transactions"
+                   f"?api-key={HELIUS_API_KEY}&limit=100")
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                if r.status != 200:
+                    log.warning("Helius %s status: %d", name, r.status)
+                    continue
+                txs = await r.json()
+                if not isinstance(txs, list):
+                    continue
 
-        if not sigs:
-            return []
-
-        # Step 2: Fetch each transaction and extract new token mints
-        for sig in sigs[:10]:  # check 10 most recent
-            try:
-                tx_payload = {
-                    "jsonrpc": "2.0", "id": 1,
-                    "method": "getTransaction",
-                    "params": [sig, {
-                        "encoding": "jsonParsed",
-                        "commitment": "confirmed",
-                        "maxSupportedTransactionVersion": 0
-                    }]
-                }
-                async with session.post(HELIUS_RPC, json=tx_payload,
-                    timeout=aiohttp.ClientTimeout(total=10)) as tr:
-                    if tr.status != 200:
-                        continue
-                    tx = (await tr.json()).get("result")
-                    if not tx:
-                        continue
-
-                    block_time = tx.get("blockTime", 0) or 0
-                    age_s = now_s - block_time
+                fresh_count = 0
+                for tx in txs:
+                    ts    = tx.get("timestamp", 0) or 0
+                    age_s = now_s - ts
                     if age_s < 0 or age_s > max_age_s:
                         continue
 
-                    # Extract mints from post token balances
-                    meta = tx.get("meta") or {}
-                    for bal in (meta.get("postTokenBalances") or []):
-                        mint = bal.get("mint", "")
-                        owner = bal.get("owner", "")
-                        # Skip SOL/USDC/known stables
-                        known = {
-                            "So11111111111111111111111111111111111111112",
-                            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-                            "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
-                        }
-                        if mint and mint not in addresses and mint not in known:
+                    # Extract all token mints from transfers
+                    for transfer in (tx.get("tokenTransfers") or []):
+                        mint = transfer.get("mint", "")
+                        if mint and mint not in SKIP_MINTS and mint not in addresses:
                             addresses.append(mint)
-                            log.info("Helius new mint: %s (age: %.0fs)", mint[:8], age_s)
+                            fresh_count += 1
 
-            except Exception as e:
-                log.warning("Helius tx parse error: %s", e)
-                continue
+                    # Also check account data for new mints
+                    for ix in (tx.get("instructions") or []):
+                        for account in (ix.get("accounts") or []):
+                            # Account addresses that look like mints
+                            if (len(account) >= 32 and
+                                account not in SKIP_MINTS and
+                                account not in addresses):
+                                # We'll validate via DexScreener later
+                                pass
 
-    except Exception as e:
-        log.warning("Helius RPC error: %s", e)
+                log.info("Helius %s: %d fresh tokens", name, fresh_count)
 
-    log.info("Helius fresh tokens: %d", len(addresses))
+        except Exception as e:
+            log.warning("Helius %s error: %s", name, e)
+
+    log.info("Helius total fresh: %d", len(addresses))
     return addresses
 
 
-async def get_fresh_from_helius_enhanced(session) -> list:
+async def get_fresh_from_helius_rpc(session) -> list:
     """
-    Helius Enhanced API — parse ADD_LIQUIDITY events to find new pools.
-    This catches coins the moment they get their first liquidity added.
+    Helius RPC — get signatures for multiple programs in parallel
+    and extract new token mints from recent transactions.
+    Developer plan allows 50 req/s so we can do this efficiently.
     """
     addresses = []
     now_s     = int(time.time())
     max_age_s = MAX_AGE_MINUTES * 60
 
-    try:
-        raydium_amm = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp"
-        url = (f"{HELIUS_API}/addresses/{raydium_amm}/transactions"
-               f"?api-key={HELIUS_API_KEY}&limit=50")
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
-            if r.status != 200:
-                log.warning("Helius enhanced status: %d", r.status)
-                return []
-            txs = await r.json()
-            if not isinstance(txs, list):
-                return []
+    async def fetch_sigs(program: str) -> list:
+        payload = {
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": [program, {"limit": 100, "commitment": "confirmed"}]
+        }
+        try:
+            async with session.post(HELIUS_RPC, json=payload,
+                timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    return [s["signature"] for s in (data.get("result") or [])
+                            if not s.get("err") and
+                            abs(now_s - (s.get("blockTime") or 0)) <= max_age_s]
+        except Exception as e:
+            log.warning("fetch_sigs error: %s", e)
+        return []
 
-            for tx in txs:
-                ts    = tx.get("timestamp", 0) or 0
-                age_s = now_s - ts
-                if age_s < 0 or age_s > max_age_s:
+    # Fetch signatures for all programs in parallel
+    sig_results = await asyncio.gather(
+        fetch_sigs(RAYDIUM_AMM),
+        fetch_sigs(RAYDIUM_CPMM),
+        fetch_sigs(PUMPFUN_PROGRAM),
+        return_exceptions=True
+    )
+
+    all_sigs = []
+    for r in sig_results:
+        if isinstance(r, list):
+            all_sigs.extend(r)
+
+    log.info("Helius RPC: %d fresh sigs total", len(all_sigs))
+
+    # Fetch transactions in batches of 10 (developer rate limit allows this)
+    for i in range(0, min(len(all_sigs), 30), 10):
+        batch = all_sigs[i:i+10]
+        fetch_tasks = []
+        for sig in batch:
+            payload = {
+                "jsonrpc": "2.0", "id": 1,
+                "method": "getTransaction",
+                "params": [sig, {
+                    "encoding": "jsonParsed",
+                    "commitment": "confirmed",
+                    "maxSupportedTransactionVersion": 0
+                }]
+            }
+            fetch_tasks.append(
+                session.post(HELIUS_RPC, json=payload,
+                    timeout=aiohttp.ClientTimeout(total=10))
+            )
+
+        try:
+            responses = await asyncio.gather(*fetch_tasks, return_exceptions=True)
+            for resp in responses:
+                if isinstance(resp, Exception):
                     continue
-                tx_type = (tx.get("type") or "").upper()
-                # Look for ADD_LIQUIDITY or INITIALIZE events
-                if tx_type not in ("ADD_LIQUIDITY", "INITIALIZE",
-                                   "SWAP", "UNKNOWN"):
+                try:
+                    async with resp as r:
+                        if r.status != 200:
+                            continue
+                        tx = (await r.json()).get("result")
+                        if not tx:
+                            continue
+                        meta = tx.get("meta") or {}
+                        for bal in (meta.get("postTokenBalances") or []):
+                            mint = bal.get("mint", "")
+                            if mint and mint not in SKIP_MINTS and mint not in addresses:
+                                addresses.append(mint)
+                                log.info("RPC new mint: %s", mint[:10])
+                except Exception:
                     continue
-                for transfer in (tx.get("tokenTransfers") or []):
-                    mint = transfer.get("mint", "")
-                    known = {
-                        "So11111111111111111111111111111111111111112",
-                        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-                    }
-                    if mint and mint not in addresses and mint not in known:
-                        addresses.append(mint)
-                        log.info("Helius enhanced mint: %s (%.0fs)", mint[:8], age_s)
+        except Exception as e:
+            log.warning("Batch fetch error: %s", e)
 
-        log.info("Helius enhanced: %d fresh tokens", len(addresses))
-    except Exception as e:
-        log.warning("Helius enhanced error: %s", e)
-
+    log.info("Helius RPC fresh mints: %d", len(addresses))
     return addresses
 
 
@@ -452,8 +484,9 @@ async def get_all_latest_tokens(session) -> list:
     Multi-source parallel fresh coin discovery.
     Helius (primary) + DexScreener + GeckoTerminal (backups).
     """
+    # Run all sources in parallel — Helius developer allows 50 req/s
     helius_task  = asyncio.create_task(get_fresh_from_helius(session))
-    helius2_task = asyncio.create_task(get_fresh_from_helius_enhanced(session))
+    helius2_task = asyncio.create_task(get_fresh_from_helius_rpc(session))
     dex_task     = asyncio.create_task(get_fresh_from_dexscreener(session))
     gecko_task   = asyncio.create_task(get_fresh_from_geckoterminal(session))
 
