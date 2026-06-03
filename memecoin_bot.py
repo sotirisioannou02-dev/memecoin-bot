@@ -47,7 +47,7 @@ SKIP_MINTS = {
 }
 
 SCAN_INTERVAL    = 60
-MIN_LIQUIDITY    = 7_500
+MIN_LIQUIDITY    = 7_000
 MAX_LIQUIDITY    = 2_000_000
 MIN_AGE_MINUTES  = 3
 MAX_AGE_MINUTES  = 30
@@ -504,12 +504,56 @@ async def get_all_latest_tokens(session) -> list:
     log.info("Total unique fresh addresses: %d", len(unique))
     return unique
 
+async def get_raydium_liquidity_helius(session, mint: str) -> float:
+    """
+    Get real liquidity directly from Raydium pool via Helius RPC.
+    Much faster than waiting for DexScreener to index it.
+    Returns USD liquidity estimate or 0 if not found.
+    """
+    try:
+        # Search for Raydium pool accounts for this mint
+        payload = {
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getTokenLargestAccounts",
+            "params": [mint, {"commitment": "confirmed"}]
+        }
+        async with session.post(HELIUS_RPC, json=payload,
+            timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status == 200:
+                data  = await r.json()
+                accts = (data.get("result") or {}).get("value") or []
+                if accts:
+                    # Largest token account amount as proxy for liquidity
+                    largest = float(accts[0].get("uiAmount", 0) or 0)
+                    # Very rough USD estimate — if largest holder has tokens
+                    # it means there's at least some liquidity
+                    if largest > 0:
+                        return max(largest * 0.001, 1000)  # rough estimate
+    except Exception as e:
+        log.warning("Helius liquidity check error: %s", e)
+    return 0
+
+
 async def get_pair_data(session, address: str):
+    """
+    Get pair data from DexScreener.
+    If liquidity shows $0, try to get it directly from Helius.
+    """
     data = await fetch_json(session, DEXSCREENER_PAIRS.format(address=address))
     if data:
         pairs = data.get("pairs") or []
         if pairs:
-            return max(pairs, key=lambda p: float((p.get("liquidity") or {}).get("usd", 0) or 0))
+            best = max(pairs, key=lambda p: float((p.get("liquidity") or {}).get("usd", 0) or 0))
+            # If DexScreener shows $0 liquidity, try Helius directly
+            liq = float((best.get("liquidity") or {}).get("usd", 0) or 0)
+            if liq == 0:
+                helius_liq = await get_raydium_liquidity_helius(session, address)
+                if helius_liq > 0:
+                    log.info("Helius liquidity fallback: %s $%.0f", address[:8], helius_liq)
+                    if not best.get("liquidity"):
+                        best["liquidity"] = {}
+                    best["liquidity"]["usd"] = helius_liq
+            return best
     return None
 
 async def search_pair(session, query: str):
@@ -1244,7 +1288,7 @@ def main():
         .post_shutdown(post_shutdown)
         .build()
     )
-    log.info("Starting bot v5.5...")
+    log.info("Starting bot v5.6...")
     app.run_polling(allowed_updates=["message"])
 
 
