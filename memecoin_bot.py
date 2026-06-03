@@ -1045,6 +1045,96 @@ async def followup_loop(bot, portfolio, whales, session):
                 if chg_pct >= PUMP_THRESHOLD and not item["pumped_alerted"]:
                     item["pumped_alerted"] = True
                     await bot.send_message(chat_id=CHAT_ID, text=(
+                        f"PUMP ALERT\n\n"
+                        f"{item['name']} (${item['symbol']}) is up {chg_pct:+.1f}%\n\n"
+                        f"Entry: ${entry:.8f}\nNow: ${cur:.8f}\n\n"
+                        f"Consider taking some profit!\n\n"
+                        f"DexScreener: {dex_link}"
+                    ), disable_web_page_preview=True)
+                    record_whale_result(item.get("holders_snap", []), whales, won=True)
+                if chg_pct <= DUMP_THRESHOLD and not item["dumped_alerted"]:
+                    item["dumped_alerted"] = True
+                    await bot.send_message(chat_id=CHAT_ID, text=(
+                        f"DUMP ALERT\n\n"
+                        f"{item['name']} (${item['symbol']}) is down {chg_pct:.1f}%\n\n"
+                        f"Entry: ${entry:.8f}\nNow: ${cur:.8f}\n\n"
+                        f"Consider cutting losses!\n\n"
+                        f"DexScreener: {dex_link}"
+                    ), disable_web_page_preview=True)
+                to_keep.append(item)
+            except Exception as e:
+                log.warning("Follow-up error: %s", e)
+                to_keep.append(item)
+        portfolio.clear()
+        portfolio.extend(to_keep)
+
+
+# ── Daily summary ─────────────────────────────────────────────────────────────
+
+async def daily_summary_loop(bot, portfolio, whales, session):
+    while True:
+        now_utc  = datetime.now(timezone.utc)
+        next_8am = now_utc.replace(hour=DAILY_SUMMARY_HOUR, minute=0, second=0, microsecond=0)
+        if now_utc >= next_8am:
+            from datetime import timedelta
+            next_8am = next_8am + timedelta(days=1)
+        await asyncio.sleep((next_8am - now_utc).total_seconds())
+        try:
+            today_start = int(time.time()) - 86400
+            todays      = [p for p in portfolio if p.get("alert_time", 0) >= today_start]
+            pumped = dumped = live = 0
+            lines  = []
+            for item in todays:
+                pair = await get_pair_data(session, item["mint"])
+                if pair:
+                    try:
+                        cur  = float(pair.get("priceUsd", 0) or 0)
+                        chg  = ((cur - item["entry_price"]) / item["entry_price"] * 100) if item["entry_price"] > 0 else 0
+                        e    = "💎" if chg >= 50 else ("✅" if chg >= 0 else "❌")
+                        lines.append(f"  {e} ${item['symbol']}: {'+' if chg>=0 else ''}{chg:.1f}%")
+                        if chg >= 30:   pumped += 1
+                        elif chg <= -30:dumped += 1
+                        else:           live   += 1
+                    except Exception:
+                        lines.append(f"  ? ${item['symbol']}: N/A")
+            good_whales = sum(1 for w in whales.values() if w.get("wins", 0) >= 2)
+            summary = (
+                f"DAILY SUMMARY\n"
+                f"{now_utc.strftime('%B %d, %Y')}\n\n"
+                f"Gems sent today: {len(todays)}\n"
+                f"Pumped 30%+: {pumped}\n"
+                f"Dumped 30%+: {dumped}\n"
+                f"Still live: {live}\n\n"
+            )
+            if lines:
+                summary += "Performance:\n" + "\n".join(lines) + "\n\n"
+            summary += (
+                f"Whale tracker:\n"
+                f"  Wallets tracked: {len(whales)}\n"
+                f"  Proven winners (2+ wins): {good_whales}\n\n"
+                f"Cloud memory: ACTIVE (Supabase)\n"
+                f"Scanner running 24/7!"
+            )
+            await bot.send_message(chat_id=CHAT_ID, text=summary, disable_web_page_preview=True)
+            log.info("Daily summary sent.")
+        except Exception as e:
+            log.error("Daily summary error: %s", e)
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+async def post_init(app):
+    session = aiohttp.ClientSession()
+    seen, whales, portfolio = await load_all_from_cloud(session)
+    bot = app.bot
+    app.bot_data.update({"session": session, "seen": seen,
+                          "whales": whales, "portfolio": portfolio})
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND,
+        make_group_handler(seen, session, bot, portfolio, whales)
+    ))
+    try:
+        await bot.send_message(chat_id=CHAT_ID, text=(
             "Memecoin Scanner v5.6 is LIVE\n"
             "HELIUS LIQUIDITY FIX\n\n"
             "Key fix: Helius liquidity fallback\n"
@@ -1059,7 +1149,7 @@ async def followup_loop(bot, portfolio, whales, session):
             "Cloud memory: ACTIVE\n"
             "Group scanner: ACTIVE"
         ))
-        except TelegramError as e:
+    except TelegramError as e:
         log.error("Startup message failed: %s", e)
     asyncio.create_task(scanner_loop(bot, seen, session, portfolio, whales))
     asyncio.create_task(followup_loop(bot, portfolio, whales, session))
