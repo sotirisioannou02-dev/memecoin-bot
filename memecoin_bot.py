@@ -693,10 +693,8 @@ def passes_filters(pair: dict, rug_score: int, holders: list, deployer: str,
     if dev_sold:
         return False, f"dev sold: {dev_reason}"
 
-    # 8. Social links
+    # 8. Twitter required (website optional)
     website, twitter = extract_socials(pair)
-    if not website:
-        return False, "no website"
     if not twitter:
         return False, "no Twitter/X"
 
@@ -716,22 +714,23 @@ def passes_filters(pair: dict, rug_score: int, holders: list, deployer: str,
         if owner_count >= 4:
             return False, f"too many owner wallets ({owner_count}/10)"
 
-    # 10. PumpSwap rejection
-    dex_id = (pair.get("dexId") or "").lower()
-    if "pumpswap" in dex_id or ("pump" in dex_id and "raydium" not in dex_id):
-        return False, "on PumpSwap — not graduated to Raydium"
+    # 10. Allow PumpSwap AND Raydium
+    dex_id    = (pair.get("dexId") or "").lower()
+    is_pumpswap = "pumpswap" in dex_id or "pump-swap" in dex_id
 
-    # 11. Low LP Providers
-    for risk in (risks or []):
-        name = (risk.get("name") or "").lower()
-        desc = (risk.get("description") or "").lower()
-        if "lp provider" in name or "lp provider" in desc or "few users" in desc:
-            return False, "low LP providers — easy to rug"
+    # 11. Low LP warning — only block on Raydium (PumpSwap always has few LPs)
+    if not is_pumpswap:
+        for risk in (risks or []):
+            name = (risk.get("name") or "").lower()
+            desc = (risk.get("description") or "").lower()
+            if "lp provider" in name or "lp provider" in desc or "few users" in desc:
+                return False, "low LP providers — easy to rug"
 
-    # 12. Address ends in 'pump'
-    base_addr = (pair.get("baseToken") or {}).get("address", "")
-    if base_addr.endswith("pump"):
-        return False, "address ends in 'pump' — not graduated"
+    # 12. PumpSwap extra check — stricter top holder (10% max vs 15%)
+    if is_pumpswap and holders:
+        pcts = [normalize_pct(float(h.get("pct", 0))) for h in holders[:10]]
+        if pcts and pcts[0] >= 10.0:
+            return False, f"PumpSwap top holder too high ({pcts[0]:.1f}%)"
 
     return True, ""
 
@@ -1209,16 +1208,14 @@ async def post_init(app):
     ))
     try:
         await bot.send_message(chat_id=CHAT_ID, text=(
-            "Memecoin Scanner v5.4 is LIVE\n"
-            "HELIUS DEVELOPER EDITION\n\n"
-            "Powered by Helius Developer (10M credits/day)\n"
-            "Monitoring 3 DEX programs in parallel:\n"
-            "- Raydium AMM v4\n"
-            "- Raydium CPMM\n"
-            "- Pump.fun program\n\n"
-            "Finding coins under 2 minutes old!\n\n"
-            "All 12 filters active.\n"
-            "Cloud memory: Supabase ACTIVE.\n"
+            "Memecoin Scanner v5.5 is LIVE\n"
+            "FILTER UPDATE\n\n"
+            "Changes:\n"
+            "- Website not required (Twitter only)\n"
+            "- PumpSwap coins now allowed\n"
+            "- Stricter PumpSwap top holder (10%)\n\n"
+            "Helius Developer active.\n"
+            "All other filters active.\n"
             "Group scanner: ACTIVE."
         ))
     except TelegramError as e:
@@ -1247,7 +1244,7 @@ def main():
         .post_shutdown(post_shutdown)
         .build()
     )
-    log.info("Starting bot v5.4...")
+    log.info("Starting bot v5.5...")
     app.run_polling(allowed_updates=["message"])
 
 
