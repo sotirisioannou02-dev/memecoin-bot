@@ -1123,6 +1123,112 @@ async def daily_summary_loop(bot, portfolio, whales, session):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+# ── Auto scanner loop ─────────────────────────────────────────────────────────
+
+async def scanner_loop(bot, seen, session, portfolio, whales):
+    alerted: set = set()
+    while True:
+        try:
+            log.info("Scanning...")
+            addresses = await get_all_latest_tokens(session)
+            log.info("Collected %d addresses.", len(addresses))
+            for addr in addresses:
+                if addr in alerted:
+                    continue
+                pair = await get_pair_data(session, addr)
+                if not pair:
+                    continue
+                created = pair.get("pairCreatedAt", 0) or 0
+                if not created:
+                    continue
+                age_min = (int(time.time() * 1000) - created) / 60_000
+                sym = (pair.get("baseToken") or {}).get("symbol", addr[:8])
+                log.info("Checking %s — age: %.1fm", sym, age_min)
+                if age_min > MAX_AGE_MINUTES:
+                    log.info("Skip %s — too old (%.1fm)", sym, age_min)
+                    continue
+                if age_min < MIN_AGE_MINUTES:
+                    log.info("Skip %s — too fresh (%.1fm)", sym, age_min)
+                    continue
+                rug_score, risks, holders, deployer = await get_rugcheck(session, addr)
+                is_graduated     = await is_pumpfun_graduate(session, addr)
+                vel_score, vel_d = check_holder_velocity(addr, len(holders))
+                whale_f, whale_d = check_known_whales(holders, whales)
+                passed, reason   = passes_filters(pair, rug_score, holders, deployer, is_graduated, risks)
+                if not passed:
+                    log.info("Filtered: %s — %s", sym, reason)
+                    continue
+                alerted.add(addr)
+                seen.add(addr)
+                await send_alert(bot, pair, rug_score, risks, holders, "Auto-scan",
+                                 is_graduated, vel_score, vel_d, whale_f, whale_d, portfolio, whales)
+                await asyncio.sleep(1)
+        except Exception as e:
+            log.error("Scanner error: %s", e)
+        log.info("Sleeping %ds...", SCAN_INTERVAL)
+        await asyncio.sleep(SCAN_INTERVAL)
+
+
+# ── Group message handler ─────────────────────────────────────────────────────
+
+def make_group_handler(seen, session, bot, portfolio, whales):
+    async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        msg = update.message
+        if not msg or not msg.text:
+            return
+        text       = msg.text
+        chat       = msg.chat
+        sender     = msg.from_user
+        group_name = chat.title or str(chat.id)
+        user_name  = (sender.username or sender.first_name) if sender else "unknown"
+        found = []
+        for a in SOLANA_ADDR_RE.findall(text): found.append(("address", a))
+        for a in EVM_ADDR_RE.findall(text):    found.append(("address", a))
+        for s in SYMBOL_RE.findall(text):      found.append(("symbol", s))
+        if not found:
+            return
+        for kind, query in found:
+            key = f"group:{query}"
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                pair = await get_pair_data(session, query) if kind == "address" else await search_pair(session, query)
+                if not pair:
+                    continue
+                mint = (pair.get("baseToken") or {}).get("address", query)
+                rug_score, risks, holders, deployer = await get_rugcheck(session, mint)
+                is_grad          = await is_pumpfun_graduate(session, mint)
+                vel_score, vel_d = check_holder_velocity(mint, len(holders))
+                whale_f, whale_d = check_known_whales(holders, whales)
+                passed, reason   = passes_filters(pair, rug_score, holders, deployer, is_grad, risks)
+                sym = (pair.get("baseToken") or {}).get("symbol", query)
+                if not passed:
+                    try:
+                        await bot.send_message(
+                            chat_id=CHAT_ID,
+                            text=(
+                                f"GROUP MENTION (failed filters)\n\n"
+                                f"Group: {group_name}\nUser: @{user_name}\n"
+                                f"Coin: {sym} ({query})\nFailed: {reason}\n\n"
+                                f"Message: {text[:200]}"
+                            ),
+                            disable_web_page_preview=True
+                        )
+                    except TelegramError:
+                        pass
+                    continue
+                source = f"Group: '{group_name}' by @{user_name}"
+                await send_alert(bot, pair, rug_score, risks, holders, source,
+                                 is_grad, vel_score, vel_d, whale_f, whale_d, portfolio, whales)
+            except Exception as e:
+                log.error("Group handler error: %s", e)
+            await asyncio.sleep(0.5)
+    return handle
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
 async def post_init(app):
     session = aiohttp.ClientSession()
     seen, whales, portfolio = await load_all_from_cloud(session)
