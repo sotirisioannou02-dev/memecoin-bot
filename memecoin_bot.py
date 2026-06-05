@@ -1,8 +1,10 @@
 """
-Memecoin Auto-Scanner Bot v5.3 — Permanent Cloud Memory
-- All memory saved to Supabase cloud (survives Railway restarts)
-- Auto-backup every 5 minutes
-- All v5.2 filters intact
+Memecoin Auto-Scanner Bot v5.7
+- Paper trading mode (no real money)
+- Rug score lowered to 60+
+- Min market cap $5,000
+- Helius liquidity fallback
+- All previous features intact
 """
 
 import asyncio
@@ -11,41 +13,33 @@ import os
 import re
 import time
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import aiohttp
 from telegram import Bot, Update
 from telegram.error import TelegramError
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 
-# ── Config ────────────────────────────────────────────────────────────────────
+# Config
 BOT_TOKEN    = os.getenv("BOT_TOKEN",    "YOUR_BOT_TOKEN_HERE")
 CHAT_ID      = os.getenv("CHAT_ID",     "YOUR_CHAT_ID_HERE")
 SUPABASE_URL = os.getenv("SUPABASE_URL","https://xzxplgjpfknoeezawmvr.supabase.co")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY","eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inh6eHBsZ2pwZmtub2VlemF3bXZyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODAxMzg3NTcsImV4cCI6MjA5NTcxNDc1N30.eM8snBlDjWuqPoPQzWjTspKg_M8cUFSDW6_bfyPceFg")
-
-SUPABASE_TABLE   = "bot_memory"
-BACKUP_INTERVAL  = 300   # save to cloud every 5 min
-
-# Helius API — Developer Plan (10M credits, 50 req/s)
-HELIUS_API_KEY   = "8fdbbc24-7fc5-4d65-a454-90f015afa71e"
-HELIUS_RPC       = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
-HELIUS_API       = "https://api.helius.xyz/v0"
-HELIUS_WS        = f"wss://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
-
-# Raydium + Pump.fun program addresses
-RAYDIUM_AMM      = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp"
-RAYDIUM_CPMM     = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C"
-PUMPFUN_PROGRAM  = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
-
-# Known stablecoins/base tokens to skip
+HELIUS_API_KEY  = os.getenv("HELIUS_API_KEY", "8fdbbc24-7fc5-4d65-a454-90f015afa71e")
+HELIUS_RPC      = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+HELIUS_API      = "https://api.helius.xyz/v0"
+HELIUS_WS       = f"wss://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+RAYDIUM_AMM     = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp"
+RAYDIUM_CPMM    = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C"
+PUMPFUN_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 SKIP_MINTS = {
-    "So11111111111111111111111111111111111111112",   # SOL
-    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", # USDC
-    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", # USDT
-    "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",  # mSOL
+    "So11111111111111111111111111111111111111112",
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
 }
 
+SUPABASE_TABLE   = "bot_memory"
+BACKUP_INTERVAL  = 300
 SCAN_INTERVAL    = 60
 MIN_LIQUIDITY    = 7_000
 MAX_LIQUIDITY    = 2_000_000
@@ -54,71 +48,87 @@ MAX_AGE_MINUTES  = 30
 MAX_TOP_HOLDER   = 15.0
 MAX_TOP10        = 40.0
 MIN_BUY_PRESSURE = 65.0
-MIN_MCAP         = 10_000
+MIN_MCAP         = 5_000
 MAX_MCAP         = 500_000
+MIN_RUG_SCORE    = 60
 FOLLOWUP_INTERVAL  = 60
 FOLLOWUP_DURATION  = 3600 * 4
-PUMP_THRESHOLD     = 50.0
-DUMP_THRESHOLD     = -30.0
+PUMP_THRESHOLD     = 80.0
+DUMP_THRESHOLD     = -25.0
 DAILY_SUMMARY_HOUR = 8
+
+# Paper trading
+PAPER_MODE       = os.getenv("PAPER_MODE", "true").lower() == "true"
+PAPER_TRADE_SIZE = float(os.getenv("PAPER_TRADE_SIZE", "20"))
 
 SEEN_FILE      = "seen_tokens.json"
 WHALE_FILE     = "whale_wallets.json"
 PORTFOLIO_FILE = "portfolio.json"
+PAPER_FILE     = "paper_trades.json"
 
 DEXSCREENER_PAIRS  = "https://api.dexscreener.com/latest/dex/tokens/{address}"
 DEXSCREENER_SEARCH = "https://api.dexscreener.com/latest/dex/search?q={query}"
-
-# Pump.fun graduated tokens — coins that just moved from Pump.fun to Raydium
-# These are genuinely new (last few hours) and have proven organic demand
-PUMPFUN_GRADUATING = "https://frontend-api.pump.fun/coins/recently-graduated?offset=0&limit=50&includeNsfw=false"
-PUMPFUN_NEW        = "https://frontend-api.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=DESC&includeNsfw=false"
-
-# DexScreener search for very new Raydium pairs
-DEXSCREENER_NEW_RAYDIUM = "https://api.dexscreener.com/latest/dex/pairs/solana/raydium"
-RUGCHECK_SUMMARY    = "https://api.rugcheck.xyz/v1/tokens/{mint}/report/summary"
-RUGCHECK_FULL       = "https://api.rugcheck.xyz/v1/tokens/{mint}/report"
+RUGCHECK_SUMMARY   = "https://api.rugcheck.xyz/v1/tokens/{mint}/report/summary"
+RUGCHECK_FULL      = "https://api.rugcheck.xyz/v1/tokens/{mint}/report"
 
 SOLANA_ADDR_RE = re.compile(r'\b[1-9A-HJ-NP-Za-km-z]{32,44}\b')
 EVM_ADDR_RE    = re.compile(r'\b0x[a-fA-F0-9]{40}\b')
 SYMBOL_RE      = re.compile(r'\$([A-Z]{2,10})\b')
+_holder_snapshots: dict = {}
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
 
-_holder_snapshots: dict = {}
+
+# Persistence
+def load_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+def save_json(path, data):
+    try:
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        log.warning("Save error %s: %s", path, e)
+
+def load_seen(): return set(load_json(SEEN_FILE, []))
+def save_seen(s): save_json(SEEN_FILE, list(s))
+def load_whales(): return load_json(WHALE_FILE, {})
+def save_whales(w): save_json(WHALE_FILE, w)
+def load_portfolio(): return load_json(PORTFOLIO_FILE, [])
+def save_portfolio(p): save_json(PORTFOLIO_FILE, p)
+def load_paper(): return load_json(PAPER_FILE, [])
+def save_paper(p): save_json(PAPER_FILE, p)
 
 
-# ── Supabase cloud persistence ────────────────────────────────────────────────
-
-def _sb_headers() -> dict:
+# Supabase
+def sb_headers():
     return {
-        "apikey":        SUPABASE_KEY,
+        "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
-        "Content-Type":  "application/json",
-        "Prefer":        "resolution=merge-duplicates",
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates",
     }
 
-async def cloud_save(session: aiohttp.ClientSession, key: str, value):
-    """Save a value to Supabase."""
+async def cloud_save(session, key, value):
     try:
         url  = f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}"
         body = {"key": key, "value": value, "updated_at": datetime.now(timezone.utc).isoformat()}
-        async with session.post(url, headers=_sb_headers(), json=body,
+        async with session.post(url, headers=sb_headers(), json=body,
                                 timeout=aiohttp.ClientTimeout(total=10)) as r:
-            if r.status in (200, 201):
-                log.info("Cloud save OK: %s", key)
-            else:
-                txt = await r.text()
-                log.warning("Cloud save failed %s: %s %s", key, r.status, txt)
+            if r.status not in (200, 201):
+                log.warning("Cloud save failed %s: %s", key, r.status)
     except Exception as e:
         log.warning("Cloud save error %s: %s", key, e)
 
-async def cloud_load(session: aiohttp.ClientSession, key: str):
-    """Load a value from Supabase. Returns None if not found."""
+async def cloud_load(session, key):
     try:
         url = f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}?key=eq.{key}&select=value"
-        async with session.get(url, headers=_sb_headers(),
+        async with session.get(url, headers=sb_headers(),
                                timeout=aiohttp.ClientTimeout(total=10)) as r:
             if r.status == 200:
                 rows = await r.json()
@@ -128,62 +138,43 @@ async def cloud_load(session: aiohttp.ClientSession, key: str):
         log.warning("Cloud load error %s: %s", key, e)
     return None
 
-async def load_all_from_cloud(session: aiohttp.ClientSession):
-    """Load seen, whales, portfolio from Supabase. Falls back to local files."""
+async def load_all_from_cloud(session):
     log.info("Loading memory from Supabase...")
-
-    seen_data      = await cloud_load(session, "seen_tokens")
-    whale_data     = await cloud_load(session, "whale_wallets")
-    portfolio_data = await cloud_load(session, "portfolio")
-
-    # Fallback to local files if cloud empty
-    def local_fallback(path, default):
-        try:
-            with open(path) as f:
-                return json.load(f)
-        except Exception:
-            return default
-
-    seen      = set(seen_data      if seen_data      is not None else local_fallback(SEEN_FILE, []))
-    whales    = dict(whale_data    if whale_data     is not None else local_fallback(WHALE_FILE, {}))
-    portfolio = list(portfolio_data if portfolio_data is not None else local_fallback(PORTFOLIO_FILE, []))
-
-    log.info("Loaded: %d seen, %d whales, %d portfolio items", len(seen), len(whales), len(portfolio))
+    seen_d  = await cloud_load(session, "seen_tokens")
+    whale_d = await cloud_load(session, "whale_wallets")
+    port_d  = await cloud_load(session, "portfolio")
+    seen      = set(seen_d      if seen_d      is not None else load_json(SEEN_FILE, []))
+    whales    = dict(whale_d    if whale_d     is not None else load_json(WHALE_FILE, {}))
+    portfolio = list(port_d     if port_d      is not None else load_json(PORTFOLIO_FILE, []))
+    log.info("Loaded: %d seen, %d whales, %d portfolio", len(seen), len(whales), len(portfolio))
     return seen, whales, portfolio
 
-async def save_all_to_cloud(session: aiohttp.ClientSession, seen: set, whales: dict, portfolio: list):
-    """Save all memory to Supabase + local files as backup."""
+async def save_all_to_cloud(session, seen, whales, portfolio):
     await asyncio.gather(
         cloud_save(session, "seen_tokens",   list(seen)),
         cloud_save(session, "whale_wallets", whales),
         cloud_save(session, "portfolio",     portfolio),
     )
-    # Also save locally as backup
     for path, data in [(SEEN_FILE, list(seen)), (WHALE_FILE, whales), (PORTFOLIO_FILE, portfolio)]:
         try:
             with open(path, "w") as f:
                 json.dump(data, f)
-        except Exception as e:
-            log.warning("Local save error %s: %s", path, e)
+        except Exception:
+            pass
 
-async def backup_loop(session: aiohttp.ClientSession, seen: set, whales: dict, portfolio: list):
-    """Auto-backup to cloud every 5 minutes. Caps seen list at 1000 to prevent bloat."""
+async def backup_loop(session, seen, whales, portfolio):
     while True:
         await asyncio.sleep(BACKUP_INTERVAL)
         log.info("Auto-backup to Supabase...")
-        # Cap seen list at 1000 most recent — prevents it growing forever
-        # and ensures Supabase clear actually takes effect on restart
         if len(seen) > 1000:
-            seen_list = list(seen)
+            sl = list(seen)
             seen.clear()
-            seen.update(seen_list[-1000:])
-            log.info("Capped seen list to 1000 items.")
+            seen.update(sl[-1000:])
         await save_all_to_cloud(session, seen, whales, portfolio)
 
 
-# ── Formatters ────────────────────────────────────────────────────────────────
-
-def fmt_usd(n) -> str:
+# Formatters
+def fmt_usd(n):
     try:
         n = float(n)
         if n >= 1_000_000: return f"${n/1_000_000:.2f}M"
@@ -192,40 +183,39 @@ def fmt_usd(n) -> str:
     except Exception:
         return "N/A"
 
-def fmt_pct(n) -> str:
+def fmt_pct(n):
     try:
         n = float(n)
         return f"{'+' if n >= 0 else ''}{n:.1f}%"
     except Exception:
         return "N/A"
 
-def minutes_ago(unix_ms: int) -> str:
+def minutes_ago(unix_ms):
     diff = (int(time.time() * 1000) - unix_ms) / 60_000
     if diff < 60:   return f"{int(diff)}m ago"
     if diff < 1440: return f"{diff/60:.1f}h ago"
     return f"{diff/1440:.1f}d ago"
 
-def pct_arrow(v) -> str:
+def pct_arrow(v):
     try:
         v = float(v)
         return f"{'up' if v >= 0 else 'down'} {v:+.2f}%"
     except Exception:
         return "N/A"
 
-def rug_label(score: int) -> str:
-    display = min(score, 100)
-    if score >= 80: return f"LOW (score {display}/100)"
-    if score >= 50: return f"MEDIUM (score {display}/100)"
-    if score >= 30: return f"HIGH (score {display}/100)"
-    return f"VERY HIGH (score {display}/100)"
+def rug_label(score):
+    d = min(score, 100)
+    if score >= 80: return f"LOW ({d}/100)"
+    if score >= 60: return f"MEDIUM ({d}/100)"
+    if score >= 30: return f"HIGH ({d}/100)"
+    return f"VERY HIGH ({d}/100)"
 
-def normalize_pct(raw: float) -> float:
+def normalize_pct(raw):
     return raw * 100 if raw <= 1.0 else raw
 
 
-# ── Social links ──────────────────────────────────────────────────────────────
-
-def extract_socials(pair: dict) -> tuple:
+# Social links
+def extract_socials(pair):
     website = ""
     twitter = ""
     info = pair.get("info") or {}
@@ -250,9 +240,8 @@ def extract_socials(pair: dict) -> tuple:
     return website, twitter
 
 
-# ── API helpers ───────────────────────────────────────────────────────────────
-
-async def fetch_json(session, url: str):
+# API helpers
+async def fetch_json(session, url):
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
             if r.status == 200:
@@ -261,257 +250,8 @@ async def fetch_json(session, url: str):
         log.warning("fetch error %s: %s", url[:60], e)
     return None
 
-async def get_fresh_from_helius(session) -> list:
-    """
-    Helius Developer — fetch new token mints from Raydium + Pump.fun
-    using the Enhanced Transactions API (available on Developer plan).
-    Monitors multiple DEX programs simultaneously.
-    """
-    addresses = []
-    now_s     = int(time.time())
-    max_age_s = MAX_AGE_MINUTES * 60
-
-    programs = [
-        (RAYDIUM_AMM,  "Raydium AMM"),
-        (RAYDIUM_CPMM, "Raydium CPMM"),
-        (PUMPFUN_PROGRAM, "Pump.fun"),
-    ]
-
-    for program, name in programs:
-        try:
-            # Enhanced Transactions API — human readable, structured data
-            url = (f"{HELIUS_API}/addresses/{program}/transactions"
-                   f"?api-key={HELIUS_API_KEY}&limit=100")
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
-                if r.status != 200:
-                    log.warning("Helius %s status: %d", name, r.status)
-                    continue
-                txs = await r.json()
-                if not isinstance(txs, list):
-                    continue
-
-                fresh_count = 0
-                for tx in txs:
-                    ts    = tx.get("timestamp", 0) or 0
-                    age_s = now_s - ts
-                    if age_s < 0 or age_s > max_age_s:
-                        continue
-
-                    # Extract all token mints from transfers
-                    for transfer in (tx.get("tokenTransfers") or []):
-                        mint = transfer.get("mint", "")
-                        if mint and mint not in SKIP_MINTS and mint not in addresses:
-                            addresses.append(mint)
-                            fresh_count += 1
-
-                    # Also check account data for new mints
-                    for ix in (tx.get("instructions") or []):
-                        for account in (ix.get("accounts") or []):
-                            # Account addresses that look like mints
-                            if (len(account) >= 32 and
-                                account not in SKIP_MINTS and
-                                account not in addresses):
-                                # We'll validate via DexScreener later
-                                pass
-
-                log.info("Helius %s: %d fresh tokens", name, fresh_count)
-
-        except Exception as e:
-            log.warning("Helius %s error: %s", name, e)
-
-    log.info("Helius total fresh: %d", len(addresses))
-    return addresses
-
-
-async def get_fresh_from_helius_rpc(session) -> list:
-    """
-    Helius RPC — get signatures for multiple programs in parallel
-    and extract new token mints from recent transactions.
-    Developer plan allows 50 req/s so we can do this efficiently.
-    """
-    addresses = []
-    now_s     = int(time.time())
-    max_age_s = MAX_AGE_MINUTES * 60
-
-    async def fetch_sigs(program: str) -> list:
-        payload = {
-            "jsonrpc": "2.0", "id": 1,
-            "method": "getSignaturesForAddress",
-            "params": [program, {"limit": 100, "commitment": "confirmed"}]
-        }
-        try:
-            async with session.post(HELIUS_RPC, json=payload,
-                timeout=aiohttp.ClientTimeout(total=10)) as r:
-                if r.status == 200:
-                    data = await r.json()
-                    return [s["signature"] for s in (data.get("result") or [])
-                            if not s.get("err") and
-                            abs(now_s - (s.get("blockTime") or 0)) <= max_age_s]
-        except Exception as e:
-            log.warning("fetch_sigs error: %s", e)
-        return []
-
-    # Fetch signatures for all programs in parallel
-    sig_results = await asyncio.gather(
-        fetch_sigs(RAYDIUM_AMM),
-        fetch_sigs(RAYDIUM_CPMM),
-        fetch_sigs(PUMPFUN_PROGRAM),
-        return_exceptions=True
-    )
-
-    all_sigs = []
-    for r in sig_results:
-        if isinstance(r, list):
-            all_sigs.extend(r)
-
-    log.info("Helius RPC: %d fresh sigs total", len(all_sigs))
-
-    # Fetch transactions in batches of 10 (developer rate limit allows this)
-    for i in range(0, min(len(all_sigs), 30), 10):
-        batch = all_sigs[i:i+10]
-        fetch_tasks = []
-        for sig in batch:
-            payload = {
-                "jsonrpc": "2.0", "id": 1,
-                "method": "getTransaction",
-                "params": [sig, {
-                    "encoding": "jsonParsed",
-                    "commitment": "confirmed",
-                    "maxSupportedTransactionVersion": 0
-                }]
-            }
-            fetch_tasks.append(
-                session.post(HELIUS_RPC, json=payload,
-                    timeout=aiohttp.ClientTimeout(total=10))
-            )
-
-        try:
-            responses = await asyncio.gather(*fetch_tasks, return_exceptions=True)
-            for resp in responses:
-                if isinstance(resp, Exception):
-                    continue
-                try:
-                    async with resp as r:
-                        if r.status != 200:
-                            continue
-                        tx = (await r.json()).get("result")
-                        if not tx:
-                            continue
-                        meta = tx.get("meta") or {}
-                        for bal in (meta.get("postTokenBalances") or []):
-                            mint = bal.get("mint", "")
-                            if mint and mint not in SKIP_MINTS and mint not in addresses:
-                                addresses.append(mint)
-                                log.info("RPC new mint: %s", mint[:10])
-                except Exception:
-                    continue
-        except Exception as e:
-            log.warning("Batch fetch error: %s", e)
-
-    log.info("Helius RPC fresh mints: %d", len(addresses))
-    return addresses
-
-
-async def get_fresh_from_dexscreener(session) -> list:
-    """
-    DexScreener — backup source for fresh pairs.
-    """
-    addresses = []
-    now_ms    = int(time.time() * 1000)
-    max_age_ms = MAX_AGE_MINUTES * 60 * 1000
-
-    for url in [
-        "https://api.dexscreener.com/latest/dex/pairs/solana/raydium",
-        "https://api.dexscreener.com/latest/dex/pairs/solana/orca",
-        "https://api.dexscreener.com/latest/dex/pairs/solana/meteora",
-    ]:
-        try:
-            data = await fetch_json(session, url)
-            if not data:
-                continue
-            for pair in (data.get("pairs") or []):
-                created = pair.get("pairCreatedAt", 0) or 0
-                if not created:
-                    continue
-                age_ms = now_ms - created
-                if 0 <= age_ms <= max_age_ms:
-                    addr = (pair.get("baseToken") or {}).get("address", "")
-                    sym  = (pair.get("baseToken") or {}).get("symbol", "???")
-                    if addr:
-                        addresses.append(addr)
-                        log.info("DexScreener fresh: %s (%.1fm)", sym, age_ms/60_000)
-        except Exception as e:
-            log.warning("DexScreener error: %s", e)
-
-    return list(set(addresses))
-
-
-async def get_fresh_from_geckoterminal(session) -> list:
-    """GeckoTerminal — additional backup source."""
-    addresses = []
-    for url in [
-        "https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=1",
-        "https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=2",
-    ]:
-        try:
-            async with session.get(url, headers={"Accept": "application/json"},
-                timeout=aiohttp.ClientTimeout(total=15)) as r:
-                if r.status != 200:
-                    continue
-                data = await r.json()
-                for pool in (data.get("data") or []):
-                    attrs       = pool.get("attributes") or {}
-                    created_str = attrs.get("pool_created_at") or ""
-                    addr        = attrs.get("base_token_address") or ""
-                    if not addr or not created_str:
-                        continue
-                    try:
-                        created_dt = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
-                        age_min    = (datetime.now(timezone.utc) - created_dt).total_seconds() / 60
-                        if 0 <= age_min <= MAX_AGE_MINUTES:
-                            addresses.append(addr)
-                            log.info("GeckoTerminal fresh: %s (%.1fm)",
-                                     attrs.get("name", addr[:8]), age_min)
-                    except Exception:
-                        pass
-        except Exception as e:
-            log.warning("GeckoTerminal error: %s", e)
-    return addresses
-
-
-async def get_all_latest_tokens(session) -> list:
-    """
-    Multi-source parallel fresh coin discovery.
-    Helius (primary) + DexScreener + GeckoTerminal (backups).
-    """
-    # Run all sources in parallel — Helius developer allows 50 req/s
-    helius_task  = asyncio.create_task(get_fresh_from_helius(session))
-    helius2_task = asyncio.create_task(get_fresh_from_helius_rpc(session))
-    dex_task     = asyncio.create_task(get_fresh_from_dexscreener(session))
-    gecko_task   = asyncio.create_task(get_fresh_from_geckoterminal(session))
-
-    results = await asyncio.gather(
-        helius_task, helius2_task, dex_task, gecko_task,
-        return_exceptions=True
-    )
-
-    addresses = []
-    for r in results:
-        if isinstance(r, list):
-            addresses.extend(r)
-
-    unique = list(set(addresses))
-    log.info("Total unique fresh addresses: %d", len(unique))
-    return unique
-
-async def get_raydium_liquidity_helius(session, mint: str) -> float:
-    """
-    Get real liquidity directly from Raydium pool via Helius RPC.
-    Much faster than waiting for DexScreener to index it.
-    Returns USD liquidity estimate or 0 if not found.
-    """
+async def get_raydium_liquidity_helius(session, mint):
     try:
-        # Search for Raydium pool accounts for this mint
         payload = {
             "jsonrpc": "2.0", "id": 1,
             "method": "getTokenLargestAccounts",
@@ -523,40 +263,31 @@ async def get_raydium_liquidity_helius(session, mint: str) -> float:
                 data  = await r.json()
                 accts = (data.get("result") or {}).get("value") or []
                 if accts:
-                    # Largest token account amount as proxy for liquidity
                     largest = float(accts[0].get("uiAmount", 0) or 0)
-                    # Very rough USD estimate — if largest holder has tokens
-                    # it means there's at least some liquidity
                     if largest > 0:
-                        return max(largest * 0.001, 1000)  # rough estimate
+                        return max(largest * 0.001, 1000)
     except Exception as e:
-        log.warning("Helius liquidity check error: %s", e)
+        log.warning("Helius liquidity error: %s", e)
     return 0
 
-
-async def get_pair_data(session, address: str):
-    """
-    Get pair data from DexScreener.
-    If liquidity shows $0, try to get it directly from Helius.
-    """
+async def get_pair_data(session, address):
     data = await fetch_json(session, DEXSCREENER_PAIRS.format(address=address))
     if data:
         pairs = data.get("pairs") or []
         if pairs:
             best = max(pairs, key=lambda p: float((p.get("liquidity") or {}).get("usd", 0) or 0))
-            # If DexScreener shows $0 liquidity, try Helius directly
-            liq = float((best.get("liquidity") or {}).get("usd", 0) or 0)
+            liq  = float((best.get("liquidity") or {}).get("usd", 0) or 0)
             if liq == 0:
-                helius_liq = await get_raydium_liquidity_helius(session, address)
-                if helius_liq > 0:
-                    log.info("Helius liquidity fallback: %s $%.0f", address[:8], helius_liq)
+                hl = await get_raydium_liquidity_helius(session, address)
+                if hl > 0:
+                    log.info("Helius liquidity fallback: %s $%.0f", address[:8], hl)
                     if not best.get("liquidity"):
                         best["liquidity"] = {}
-                    best["liquidity"]["usd"] = helius_liq
+                    best["liquidity"]["usd"] = hl
             return best
     return None
 
-async def search_pair(session, query: str):
+async def search_pair(session, query):
     data = await fetch_json(session, DEXSCREENER_SEARCH.format(query=query))
     if data:
         pairs = data.get("pairs") or []
@@ -564,7 +295,7 @@ async def search_pair(session, query: str):
             return max(pairs, key=lambda p: float((p.get("liquidity") or {}).get("usd", 0) or 0))
     return None
 
-async def get_rugcheck(session, mint: str):
+async def get_rugcheck(session, mint):
     score    = -1
     risks    = []
     holders  = []
@@ -581,7 +312,7 @@ async def get_rugcheck(session, mint: str):
             score = int(data.get("score", -1))
     return score, risks, holders, deployer
 
-async def is_pumpfun_graduate(session, mint: str) -> bool:
+async def is_pumpfun_graduate(session, mint):
     try:
         data = await fetch_json(session, DEXSCREENER_PAIRS.format(address=mint))
         if not data:
@@ -605,9 +336,166 @@ async def is_pumpfun_graduate(session, mint: str) -> bool:
         return False
 
 
-# ── Dev wallet check ──────────────────────────────────────────────────────────
+# Helius sources
+async def get_fresh_from_helius(session):
+    addresses = []
+    now_s     = int(time.time())
+    max_age_s = MAX_AGE_MINUTES * 60
+    programs  = [(RAYDIUM_AMM, "Raydium AMM"), (RAYDIUM_CPMM, "Raydium CPMM"), (PUMPFUN_PROGRAM, "Pump.fun")]
+    for program, name in programs:
+        try:
+            url = f"{HELIUS_API}/addresses/{program}/transactions?api-key={HELIUS_API_KEY}&limit=100"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                if r.status != 200:
+                    continue
+                txs = await r.json()
+                if not isinstance(txs, list):
+                    continue
+                fresh = 0
+                for tx in txs:
+                    ts    = tx.get("timestamp", 0) or 0
+                    age_s = now_s - ts
+                    if age_s < 0 or age_s > max_age_s:
+                        continue
+                    for transfer in (tx.get("tokenTransfers") or []):
+                        mint = transfer.get("mint", "")
+                        if mint and mint not in SKIP_MINTS and mint not in addresses:
+                            addresses.append(mint)
+                            fresh += 1
+                log.info("Helius %s: %d fresh tokens", name, fresh)
+        except Exception as e:
+            log.warning("Helius %s error: %s", name, e)
+    log.info("Helius total fresh: %d", len(addresses))
+    return addresses
 
-def dev_has_sold(holders: list, deployer: str) -> tuple:
+async def get_fresh_from_helius_rpc(session):
+    addresses = []
+    now_s     = int(time.time())
+    max_age_s = MAX_AGE_MINUTES * 60
+
+    async def fetch_sigs(program):
+        payload = {"jsonrpc": "2.0", "id": 1, "method": "getSignaturesForAddress",
+                   "params": [program, {"limit": 100, "commitment": "confirmed"}]}
+        try:
+            async with session.post(HELIUS_RPC, json=payload,
+                timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    return [s["signature"] for s in (data.get("result") or [])
+                            if not s.get("err") and
+                            abs(now_s - (s.get("blockTime") or 0)) <= max_age_s]
+        except Exception:
+            pass
+        return []
+
+    sig_results = await asyncio.gather(
+        fetch_sigs(RAYDIUM_AMM), fetch_sigs(RAYDIUM_CPMM), fetch_sigs(PUMPFUN_PROGRAM),
+        return_exceptions=True
+    )
+    all_sigs = []
+    for r in sig_results:
+        if isinstance(r, list):
+            all_sigs.extend(r)
+    log.info("Helius RPC: %d fresh sigs", len(all_sigs))
+
+    for sig in all_sigs[:20]:
+        try:
+            payload = {"jsonrpc": "2.0", "id": 1, "method": "getTransaction",
+                       "params": [sig, {"encoding": "jsonParsed", "commitment": "confirmed",
+                                        "maxSupportedTransactionVersion": 0}]}
+            async with session.post(HELIUS_RPC, json=payload,
+                timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status != 200:
+                    continue
+                tx = (await r.json()).get("result")
+                if not tx:
+                    continue
+                meta = tx.get("meta") or {}
+                for bal in (meta.get("postTokenBalances") or []):
+                    mint = bal.get("mint", "")
+                    if mint and mint not in SKIP_MINTS and mint not in addresses:
+                        addresses.append(mint)
+        except Exception:
+            continue
+    log.info("Helius RPC fresh mints: %d", len(addresses))
+    return addresses
+
+async def get_fresh_from_dexscreener(session):
+    addresses = []
+    now_ms    = int(time.time() * 1000)
+    max_age_ms = MAX_AGE_MINUTES * 60 * 1000
+    for url in [
+        "https://api.dexscreener.com/latest/dex/pairs/solana/raydium",
+        "https://api.dexscreener.com/latest/dex/pairs/solana/orca",
+        "https://api.dexscreener.com/latest/dex/pairs/solana/meteora",
+    ]:
+        try:
+            data = await fetch_json(session, url)
+            if not data:
+                continue
+            for pair in (data.get("pairs") or []):
+                created = pair.get("pairCreatedAt", 0) or 0
+                if not created:
+                    continue
+                age_ms = now_ms - created
+                if 0 <= age_ms <= max_age_ms:
+                    addr = (pair.get("baseToken") or {}).get("address", "")
+                    sym  = (pair.get("baseToken") or {}).get("symbol", "???")
+                    if addr:
+                        addresses.append(addr)
+                        log.info("DexScreener fresh: %s (%.1fm)", sym, age_ms/60_000)
+        except Exception as e:
+            log.warning("DexScreener error: %s", e)
+    return list(set(addresses))
+
+async def get_fresh_from_geckoterminal(session):
+    addresses = []
+    for url in [
+        "https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=1",
+        "https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=2",
+    ]:
+        try:
+            async with session.get(url, headers={"Accept": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=15)) as r:
+                if r.status != 200:
+                    continue
+                data = await r.json()
+                for pool in (data.get("data") or []):
+                    attrs       = pool.get("attributes") or {}
+                    created_str = attrs.get("pool_created_at") or ""
+                    addr        = attrs.get("base_token_address") or ""
+                    if not addr or not created_str:
+                        continue
+                    try:
+                        created_dt = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
+                        age_min    = (datetime.now(timezone.utc) - created_dt).total_seconds() / 60
+                        if 0 <= age_min <= MAX_AGE_MINUTES:
+                            addresses.append(addr)
+                    except Exception:
+                        pass
+        except Exception as e:
+            log.warning("GeckoTerminal error: %s", e)
+    return addresses
+
+async def get_all_latest_tokens(session):
+    results = await asyncio.gather(
+        get_fresh_from_helius(session),
+        get_fresh_from_helius_rpc(session),
+        get_fresh_from_dexscreener(session),
+        get_fresh_from_geckoterminal(session),
+        return_exceptions=True
+    )
+    addresses = []
+    for r in results:
+        if isinstance(r, list):
+            addresses.extend(r)
+    unique = list(set(addresses))
+    log.info("Total unique fresh addresses: %d", len(unique))
+    return unique
+
+
+# Dev wallet check
+def dev_has_sold(holders, deployer):
     if not deployer:
         return False, ""
     deployer = deployer.lower()
@@ -616,14 +504,12 @@ def dev_has_sold(holders: list, deployer: str) -> tuple:
         if addr == deployer:
             pct = normalize_pct(float(h.get("pct", 0)))
             if pct < 0.5:
-                return True, f"Dev wallet almost empty ({pct:.2f}% left)"
+                return True, f"Dev wallet almost empty ({pct:.2f}%)"
             return False, ""
-    return True, "Dev wallet not found in holders (likely sold)"
+    return True, "Dev wallet not found (likely sold)"
 
-
-# ── Holder velocity ───────────────────────────────────────────────────────────
-
-def check_holder_velocity(mint: str, current_count: int) -> tuple:
+# Holder velocity
+def check_holder_velocity(mint, current_count):
     now = time.time()
     if mint not in _holder_snapshots:
         _holder_snapshots[mint] = (current_count, now)
@@ -635,16 +521,14 @@ def check_holder_velocity(mint: str, current_count: int) -> tuple:
         return 0, "Too soon"
     growth = current_count - prev_count
     rate   = growth / elapsed_min
-    if rate >= 20:  return 3, f"Explosive holder growth: +{growth} in {elapsed_min:.0f}m ({rate:.0f}/min)"
-    if rate >= 5:   return 2, f"Strong holder growth: +{growth} in {elapsed_min:.0f}m"
-    if rate >= 1:   return 1, f"Steady holder growth: +{growth} in {elapsed_min:.0f}m"
-    if growth < 0:  return -1, f"Holders DROPPING: {growth} in {elapsed_min:.0f}m"
+    if rate >= 20:  return 3, f"Explosive growth: +{growth} in {elapsed_min:.0f}m"
+    if rate >= 5:   return 2, f"Strong growth: +{growth} in {elapsed_min:.0f}m"
+    if rate >= 1:   return 1, f"Steady growth: +{growth} in {elapsed_min:.0f}m"
+    if growth < 0:  return -1, f"Holders dropping: {growth} in {elapsed_min:.0f}m"
     return 0, f"Low growth: +{growth} in {elapsed_min:.0f}m"
 
-
-# ── Whale tracker ─────────────────────────────────────────────────────────────
-
-def check_known_whales(holders: list, whales: dict) -> tuple:
+# Whale tracker
+def check_known_whales(holders, whales):
     found = []
     for h in holders[:10]:
         addr = h.get("address", "")
@@ -654,12 +538,13 @@ def check_known_whales(holders: list, whales: dict) -> tuple:
             total= w.get("total", 0)
             pct  = normalize_pct(float(h.get("pct", 0)))
             wr   = (wins/total*100) if total > 0 else 0
-            found.append(f"Whale {addr[:6]}...{addr[-4:]} ({pct:.1f}% holding, {wins}/{total} wins, {wr:.0f}% WR)")
+            src  = w.get("source", "unknown")
+            found.append(f"{src} ({pct:.1f}% holding, {wins}/{total} wins, {wr:.0f}% WR)")
     if found:
         return True, "\n".join(found)
     return False, ""
 
-def record_whale_result(holders: list, whales: dict, won: bool):
+def record_whale_result(holders, whales, won):
     for h in holders[:5]:
         addr = h.get("address", "")
         if not addr:
@@ -676,12 +561,8 @@ def record_whale_result(holders: list, whales: dict, won: bool):
         del whales[a]
 
 
-# ── Filter logic ──────────────────────────────────────────────────────────────
-
-def passes_filters(pair: dict, rug_score: int, holders: list, deployer: str,
-                   is_graduated: bool, risks: list = None) -> tuple:
-
-    # 1. Golden age window
+# Filter logic
+def passes_filters(pair, rug_score, holders, deployer, is_graduated, risks=None):
     created_at = pair.get("pairCreatedAt", 0) or 0
     if not created_at:
         return False, "no creation time"
@@ -691,14 +572,12 @@ def passes_filters(pair: dict, rug_score: int, holders: list, deployer: str,
     if age_min > MAX_AGE_MINUTES:
         return False, f"too old ({int(age_min)}m)"
 
-    # 2. Liquidity
     liq = float((pair.get("liquidity") or {}).get("usd", 0) or 0)
     if liq < MIN_LIQUIDITY:
         return False, f"low liquidity ({fmt_usd(liq)})"
     if liq > MAX_LIQUIDITY:
         return False, f"liquidity too high ({fmt_usd(liq)})"
 
-    # 3. Market cap
     mcap = float(pair.get("fdv", 0) or 0)
     if mcap > 0:
         if mcap < MIN_MCAP:
@@ -706,13 +585,11 @@ def passes_filters(pair: dict, rug_score: int, holders: list, deployer: str,
         if mcap > MAX_MCAP:
             return False, f"mcap too high ({fmt_usd(mcap)})"
 
-    # 4. Rug score
     if rug_score == -1:
         return False, "rug score unavailable"
-    if rug_score < 80:
-        return False, f"rug not LOW ({min(rug_score,100)})"
+    if rug_score < MIN_RUG_SCORE:
+        return False, f"rug score too low ({min(rug_score,100)})"
 
-    # 5. Buy pressure
     txns  = (pair.get("txns") or {}).get("h24") or {}
     buys  = txns.get("buys", 0)
     sells = txns.get("sells", 0)
@@ -722,7 +599,6 @@ def passes_filters(pair: dict, rug_score: int, holders: list, deployer: str,
         if buy_pct < MIN_BUY_PRESSURE:
             return False, f"weak buy pressure ({buy_pct:.0f}%)"
 
-    # 6. Top holder + top 10
     if holders:
         top1 = normalize_pct(float(holders[0].get("pct", 0)))
         if top1 >= MAX_TOP_HOLDER:
@@ -732,58 +608,48 @@ def passes_filters(pair: dict, rug_score: int, holders: list, deployer: str,
         if top10 >= MAX_TOP10:
             return False, f"top 10 too concentrated ({top10:.1f}%)"
 
-    # 7. Dev wallet
+        # Clone wallet pattern
+        if len(pcts) >= 7:
+            small = pcts[1:]
+            if small and (max(small) - min(small)) <= 0.20:
+                return False, f"clone wallet pattern detected"
+        owner_count = sum(1 for h in holders[:10] if h.get("owner") or h.get("insider"))
+        if owner_count >= 4:
+            return False, f"too many owner wallets ({owner_count}/10)"
+
     dev_sold, dev_reason = dev_has_sold(holders, deployer)
     if dev_sold:
         return False, f"dev sold: {dev_reason}"
 
-    # 8. Twitter required (website optional)
-    website, twitter = extract_socials(pair)
+    _, twitter = extract_socials(pair)
     if not twitter:
         return False, "no Twitter/X"
 
-    # 9. Clone wallet pattern (mathematical)
-    if len(holders) >= 5:
-        pcts = [normalize_pct(float(h.get("pct", 0))) for h in holders[:10]]
-        small_pcts = pcts[1:]
-        if small_pcts:
-            spread = max(small_pcts) - min(small_pcts)
-            if spread <= 0.20 and len(small_pcts) >= 6:
-                return False, f"clone wallet pattern (spread {spread:.3f}%) — rug"
-        owner_count = sum(
-            1 for h in holders[:10]
-            if h.get("owner") or h.get("insider") or
-               (h.get("ownerAddress") == h.get("address"))
-        )
-        if owner_count >= 4:
-            return False, f"too many owner wallets ({owner_count}/10)"
-
-    # 10. Allow PumpSwap AND Raydium
-    dex_id    = (pair.get("dexId") or "").lower()
+    dex_id      = (pair.get("dexId") or "").lower()
     is_pumpswap = "pumpswap" in dex_id or "pump-swap" in dex_id
 
-    # 11. Low LP warning — only block on Raydium (PumpSwap always has few LPs)
     if not is_pumpswap:
         for risk in (risks or []):
             name = (risk.get("name") or "").lower()
             desc = (risk.get("description") or "").lower()
-            if "lp provider" in name or "lp provider" in desc or "few users" in desc:
-                return False, "low LP providers — easy to rug"
+            if "lp provider" in name or "few users" in desc:
+                return False, "low LP providers"
 
-    # 12. PumpSwap extra check — stricter top holder (10% max vs 15%)
     if is_pumpswap and holders:
         pcts = [normalize_pct(float(h.get("pct", 0))) for h in holders[:10]]
         if pcts and pcts[0] >= 10.0:
-            return False, f"PumpSwap top holder too high ({pcts[0]:.1f}%)"
+            return False, f"PumpSwap top holder {pcts[0]:.1f}%"
+
+    base_addr = (pair.get("baseToken") or {}).get("address", "")
+    if base_addr.endswith("pump") and not is_pumpswap:
+        return False, "address ends in pump but not on PumpSwap"
 
     return True, ""
 
 
-# ── GEM RATING ────────────────────────────────────────────────────────────────
-
+# GEM RATING
 def rate_gem(pair, rug_score, holders, risks, website, twitter,
-             is_graduated, holder_velocity, velocity_desc,
-             whale_found, whale_desc) -> tuple:
+             is_graduated, holder_velocity, velocity_desc, whale_found, whale_desc):
     score = 0
     plus  = []
     minus = []
@@ -799,17 +665,16 @@ def rate_gem(pair, rug_score, holders, risks, website, twitter,
     total = buys + sells
     created = pair.get("pairCreatedAt", 0) or 0
     age_min = (int(time.time() * 1000) - created) / 60_000 if created else 999
-    top1_pct  = 0
-    top10_pct = 0
+    top1_pct = top10_pct = 0
     if holders:
         pcts = [normalize_pct(float(h.get("pct", 0))) for h in holders[:10]]
         top1_pct  = pcts[0]
         top10_pct = sum(pcts)
 
     if is_graduated:
-        score += 4; plus.append("Graduated from Pump.fun to Raydium — proven demand")
+        score += 4; plus.append("Graduated from Pump.fun - proven demand")
     if whale_found:
-        score += 4; plus.append(f"Known winning whale!\n    {whale_desc}")
+        score += 4; plus.append(f"Known winning whale: {whale_desc}")
     if holder_velocity == 3:
         score += 3; plus.append(velocity_desc)
     elif holder_velocity == 2:
@@ -819,7 +684,7 @@ def rate_gem(pair, rug_score, holders, risks, website, twitter,
     elif holder_velocity == -1:
         score -= 2; minus.append(velocity_desc)
 
-    score += 2; plus.append("Has website + Twitter/X")
+    score += 1; plus.append("Has Twitter/X")
 
     if liq >= 100_000:   score += 3; plus.append(f"Very high liquidity ({fmt_usd(liq)})")
     elif liq >= 50_000:  score += 2; plus.append(f"Strong liquidity ({fmt_usd(liq)})")
@@ -827,8 +692,8 @@ def rate_gem(pair, rug_score, holders, risks, website, twitter,
 
     clamped = min(rug_score, 100)
     if clamped >= 95:    score += 3; plus.append(f"Excellent rug score ({clamped}/100)")
-    elif clamped >= 85:  score += 2; plus.append(f"Good rug score ({clamped}/100)")
-    else:                score += 1; plus.append(f"Acceptable rug score ({clamped}/100)")
+    elif clamped >= 80:  score += 2; plus.append(f"Good rug score ({clamped}/100)")
+    elif clamped >= 60:  score += 1; plus.append(f"Acceptable rug score ({clamped}/100)")
 
     if top1_pct > 0:
         if top1_pct < 5:    score += 3; plus.append(f"Top holder very low ({top1_pct:.1f}%)")
@@ -848,22 +713,16 @@ def rate_gem(pair, rug_score, holders, risks, website, twitter,
 
     if vol5m > 0 and liq > 0:
         spike = vol5m / liq
-        if spike >= 0.5:    score += 3; plus.append(f"Massive 5m spike ({spike:.1f}x liquidity)")
+        if spike >= 0.5:    score += 3; plus.append(f"Massive 5m spike ({spike:.1f}x)")
         elif spike >= 0.2:  score += 2; plus.append(f"Strong 5m spike ({spike:.1f}x)")
-        elif spike >= 0.05: score += 1; plus.append(f"Some 5m volume ({spike:.2f}x)")
+        elif spike >= 0.05: score += 1; plus.append(f"Some 5m volume")
         else:               minus.append("Low 5m volume")
 
-    if liq > 0 and vol24 > 0:
-        ratio = vol24 / liq
-        if ratio >= 10:     score += 2; plus.append(f"Very high 24h vol/liq ratio ({ratio:.1f}x)")
-        elif ratio >= 3:    score += 1; plus.append(f"Good 24h volume ({ratio:.1f}x)")
-        else:               minus.append(f"Moderate 24h volume ({ratio:.1f}x)")
+    if 7 <= age_min <= 15:  score += 3; plus.append(f"Perfect age ({int(age_min)}m)")
+    elif 5 <= age_min <= 20:score += 2; plus.append(f"Good age ({int(age_min)}m)")
 
-    if 7 <= age_min <= 15:  score += 3; plus.append(f"Perfect age ({int(age_min)}m) — prime entry")
-    elif 5 <= age_min <= 20:score += 2; plus.append(f"Good age ({int(age_min)}m) — still early")
-
-    if 0 < mcap <= 100_000:   score += 3; plus.append(f"Very low mcap ({fmt_usd(mcap)}) — massive upside")
-    elif mcap <= 250_000:     score += 2; plus.append(f"Low mcap ({fmt_usd(mcap)}) — good upside")
+    if 0 < mcap <= 100_000:   score += 3; plus.append(f"Very low mcap ({fmt_usd(mcap)}) - huge upside")
+    elif mcap <= 250_000:     score += 2; plus.append(f"Low mcap ({fmt_usd(mcap)})")
     elif mcap <= 500_000:     score += 1; plus.append(f"Moderate mcap ({fmt_usd(mcap)})")
 
     try:
@@ -882,18 +741,16 @@ def rate_gem(pair, rug_score, holders, risks, website, twitter,
         elif lvl == "WARN":   score -= 1; minus.append(f"Warning: {r.get('name','')}")
 
     if score >= 22:
-        return f"PERFECT (score: {score})\nHigh confidence entry.", plus, minus
+        return f"PERFECT (score: {score}) - High confidence entry.", plus, minus
     elif score >= 14:
-        return f"GOOD (score: {score})\nSolid. Worth a calculated entry.", plus, minus
+        return f"GOOD (score: {score}) - Worth a calculated entry.", plus, minus
     else:
-        return f"RISKY (score: {score})\nPassed filters but signals are mixed. Be careful.", plus, minus
+        return f"RISKY (score: {score}) - Mixed signals. Be careful.", plus, minus
 
 
-# ── Alert builder ─────────────────────────────────────────────────────────────
-
-def build_alert(pair, rug_score, risks, holders, source,
-                is_graduated, holder_velocity, velocity_desc,
-                whale_found, whale_desc) -> str:
+# Alert builder
+def build_alert(pair, rug_score, risks, holders, source, is_graduated,
+                holder_velocity, velocity_desc, whale_found, whale_desc):
     base      = pair.get("baseToken") or {}
     name      = base.get("name", "Unknown")
     symbol    = base.get("symbol", "???")
@@ -914,9 +771,8 @@ def build_alert(pair, rug_score, risks, holders, source,
     bs        = f"{buys/total*100:.0f}% buys ({buys}B/{sells}S)" if total else "no txns"
     website, twitter = extract_socials(pair)
 
-    top1_pct  = "N/A"
-    top10_pct = "N/A"
-    h_lines   = "  N/A"
+    top1_pct = top10_pct = "N/A"
+    h_lines  = "  N/A"
     if holders:
         pcts      = [normalize_pct(float(h.get("pct", 0))) for h in holders[:10]]
         top1_pct  = f"{pcts[0]:.2f}%"
@@ -939,7 +795,7 @@ def build_alert(pair, rug_score, risks, holders, source,
         pair, rug_score, holders, risks, website, twitter,
         is_graduated, holder_velocity, velocity_desc, whale_found, whale_desc)
 
-    emoji = "💎" if "PERFECT" in rating_line else ("✅" if "GOOD" in rating_line else "⚠️")
+    emoji = "PERFECT" if "PERFECT" in rating_line else ("GOOD" if "GOOD" in rating_line else "RISKY")
     plus_text  = "\n".join(f"  + {r}" for r in plus_r)  or "  None"
     minus_text = "\n".join(f"  - {r}" for r in minus_r) or "  None"
     grad_line  = "Yes (Pump.fun graduate)" if is_graduated else "No"
@@ -949,8 +805,8 @@ def build_alert(pair, rug_score, risks, holders, source,
     return (
         f"NEW GEM FOUND\n"
         f"Source: {source}\n\n"
-        f"---- GEM RATING ----\n"
-        f"{emoji} {rating_line}\n\n"
+        f"---- GEM RATING: {emoji} ----\n"
+        f"{rating_line}\n\n"
         f"Positives:\n{plus_text}\n\n"
         f"Negatives:\n{minus_text}\n"
         f"--------------------\n\n"
@@ -971,7 +827,6 @@ def build_alert(pair, rug_score, risks, holders, source,
         f"Top 10 Holders:\n{h_lines}\n\n"
         f"Rug Score: {rug_label(rug_score)}"
         f"{risk_text}\n\n"
-        f"Website: {website}\n"
         f"Twitter: {twitter}\n\n"
         f"PASSED ALL FILTERS\n\n"
         f"DexScreener: {dex_link}\n"
@@ -979,44 +834,190 @@ def build_alert(pair, rug_score, risks, holders, source,
     )
 
 
-# ── Send alert ────────────────────────────────────────────────────────────────
-
+# Send alert (paper or real)
 async def send_alert(bot, pair, rug_score, risks, holders, source,
                      is_graduated, holder_velocity, velocity_desc,
                      whale_found, whale_desc, portfolio, whales):
-    sym  = (pair.get("baseToken") or {}).get("symbol", "???")
-    name = (pair.get("baseToken") or {}).get("name", "Unknown")
-    mint = (pair.get("baseToken") or {}).get("address", "")
-    log.info("GEM: %s — sending alert", sym)
-    text = build_alert(pair, rug_score, risks, holders, source, is_graduated,
-                       holder_velocity, velocity_desc, whale_found, whale_desc)
-    try:
-        await bot.send_message(chat_id=CHAT_ID, text=text, disable_web_page_preview=True)
-    except TelegramError as te:
-        log.error("Telegram send error: %s", te)
-        return
+    sym   = (pair.get("baseToken") or {}).get("symbol", "???")
+    name  = (pair.get("baseToken") or {}).get("name", "Unknown")
+    mint  = (pair.get("baseToken") or {}).get("address", "")
+    chain = pair.get("chainId", "")
+    log.info("GEM: %s (paper=%s)", sym, PAPER_MODE)
+
     try:
         entry_price = float(pair.get("priceUsd", 0) or 0)
     except Exception:
         entry_price = 0
-    if mint and entry_price > 0:
-        portfolio.append({
-            "mint": mint, "symbol": sym, "name": name,
-            "chain": pair.get("chainId", ""),
-            "entry_price": entry_price,
-            "alert_time": int(time.time()),
-            "holders_snap": holders[:5],
-            "pumped_alerted": False,
-            "dumped_alerted": False,
-        })
+
+    if PAPER_MODE:
+        fake_eur = PAPER_TRADE_SIZE
+        liq      = fmt_usd(float((pair.get("liquidity") or {}).get("usd", 0) or 0))
+        mcap     = fmt_usd(float(pair.get("fdv", 0) or 0))
+        dex_link = f"https://dexscreener.com/{chain}/{mint}"
+        _, twitter = extract_socials(pair)
+        rating_line, plus_r, minus_r = rate_gem(
+            pair, rug_score, holders, risks, "", twitter,
+            is_graduated, holder_velocity, velocity_desc, whale_found, whale_desc)
+        emoji = "PERFECT" if "PERFECT" in rating_line else ("GOOD" if "GOOD" in rating_line else "RISKY")
+
+        msg = (
+            "PAPER TRADE - ENTRY (no real money)\n\n"
+            f"Rating: {emoji}\n"
+            f"{rating_line}\n\n"
+            f"Coin: {name} (${sym})\n"
+            f"Source: {source}\n"
+            f"Address: {mint}\n\n"
+            f"Price: ${entry_price:.8f}\n"
+            f"Liquidity: {liq}\n"
+            f"Market Cap: {mcap}\n\n"
+            f"Fake entry: EUR{fake_eur:.0f}\n"
+            f"Take profit (+80%): EUR{fake_eur*1.8:.0f} (+EUR{fake_eur*0.8:.0f})\n"
+            f"Stop loss (-25%): EUR{fake_eur*0.75:.0f} (-EUR{fake_eur*0.25:.0f})\n\n"
+            f"Monitoring for 4 hours...\n\n"
+            f"DexScreener: {dex_link}"
+        )
+        try:
+            await bot.send_message(chat_id=CHAT_ID, text=msg, disable_web_page_preview=True)
+        except TelegramError as te:
+            log.error("Paper send error: %s", te)
+            return
+
+        if mint and entry_price > 0:
+            paper = load_paper()
+            paper.append({
+                "mint": mint, "symbol": sym, "name": name, "chain": chain,
+                "entry_price": entry_price, "fake_eur": fake_eur,
+                "alert_time": int(time.time()),
+                "holders_snap": holders[:5],
+                "pumped_alerted": False, "dumped_alerted": False,
+                "closed": False, "final_pnl": None,
+            })
+            save_paper(paper)
+    else:
+        text = build_alert(pair, rug_score, risks, holders, source, is_graduated,
+                           holder_velocity, velocity_desc, whale_found, whale_desc)
+        try:
+            await bot.send_message(chat_id=CHAT_ID, text=text, disable_web_page_preview=True)
+        except TelegramError as te:
+            log.error("Alert send error: %s", te)
+            return
+        if mint and entry_price > 0:
+            portfolio.append({
+                "mint": mint, "symbol": sym, "name": name, "chain": chain,
+                "entry_price": entry_price, "alert_time": int(time.time()),
+                "holders_snap": holders[:5],
+                "pumped_alerted": False, "dumped_alerted": False,
+            })
+
     record_whale_result(holders, whales, won=False)
 
 
-# ── Follow-up price monitor ───────────────────────────────────────────────────
+# Paper followup loop
+async def paper_followup_loop(bot, session):
+    while True:
+        await asyncio.sleep(FOLLOWUP_INTERVAL)
+        if not PAPER_MODE:
+            continue
+        try:
+            paper  = load_paper()
+            now    = int(time.time())
+            changed = False
 
+            for trade in paper:
+                if trade.get("closed"):
+                    continue
+                age = now - trade.get("alert_time", now)
+                pair = await get_pair_data(session, trade["mint"])
+                if not pair:
+                    if age > FOLLOWUP_DURATION:
+                        trade["closed"] = True
+                        trade["final_pnl"] = 0
+                        changed = True
+                    continue
+
+                cur   = float(pair.get("priceUsd", 0) or 0)
+                entry = trade["entry_price"]
+                if entry <= 0:
+                    continue
+                pct  = (cur - entry) / entry * 100
+                pnl  = trade["fake_eur"] * (pct / 100)
+                dex_link = f"https://dexscreener.com/{trade['chain']}/{trade['mint']}"
+
+                # Take profit
+                if pct >= PUMP_THRESHOLD and not trade.get("pumped_alerted"):
+                    trade["pumped_alerted"] = True
+                    trade["closed"]    = True
+                    trade["final_pnl"] = pnl
+                    changed = True
+                    record_whale_result(trade.get("holders_snap", []), {}, True)
+                    msg = (
+                        "PAPER TRADE - TAKE PROFIT\n\n"
+                        f"Coin: {trade['name']} (${trade['symbol']})\n\n"
+                        f"Entry: EUR{trade['fake_eur']:.0f} at ${entry:.8f}\n"
+                        f"Exit:  ${cur:.8f}\n"
+                        f"Change: +{pct:.1f}%\n\n"
+                        f"Fake profit: +EUR{pnl:.2f}\n"
+                        f"EUR{trade['fake_eur']:.0f} -> EUR{trade['fake_eur']+pnl:.2f}\n\n"
+                        f"Real money equivalent: +EUR{pnl:.2f}\n\n"
+                        f"DexScreener: {dex_link}"
+                    )
+                    try:
+                        await bot.send_message(chat_id=CHAT_ID, text=msg, disable_web_page_preview=True)
+                    except TelegramError:
+                        pass
+
+                # Stop loss
+                elif pct <= DUMP_THRESHOLD and not trade.get("dumped_alerted"):
+                    trade["dumped_alerted"] = True
+                    trade["closed"]    = True
+                    trade["final_pnl"] = pnl
+                    changed = True
+                    msg = (
+                        "PAPER TRADE - STOP LOSS\n\n"
+                        f"Coin: {trade['name']} (${trade['symbol']})\n\n"
+                        f"Entry: EUR{trade['fake_eur']:.0f} at ${entry:.8f}\n"
+                        f"Exit:  ${cur:.8f}\n"
+                        f"Change: {pct:.1f}%\n\n"
+                        f"Fake loss: -EUR{abs(pnl):.2f}\n"
+                        f"EUR{trade['fake_eur']:.0f} -> EUR{trade['fake_eur']+pnl:.2f}\n\n"
+                        f"Good thing this was paper trading!\n\n"
+                        f"DexScreener: {dex_link}"
+                    )
+                    try:
+                        await bot.send_message(chat_id=CHAT_ID, text=msg, disable_web_page_preview=True)
+                    except TelegramError:
+                        pass
+
+                # Force close after 4 hours
+                elif age > FOLLOWUP_DURATION and not trade.get("closed"):
+                    trade["closed"]    = True
+                    trade["final_pnl"] = pnl
+                    changed = True
+                    msg = (
+                        "PAPER TRADE - EXPIRED (4h)\n\n"
+                        f"Coin: {trade['name']} (${trade['symbol']})\n"
+                        f"Final change: {pct:+.1f}%\n"
+                        f"Final P&L: {'+'if pnl>=0 else ''}EUR{pnl:.2f}\n\n"
+                        f"DexScreener: {dex_link}"
+                    )
+                    try:
+                        await bot.send_message(chat_id=CHAT_ID, text=msg, disable_web_page_preview=True)
+                    except TelegramError:
+                        pass
+
+            if changed:
+                save_paper(paper)
+
+        except Exception as e:
+            log.error("Paper followup error: %s", e)
+
+
+# Real followup loop
 async def followup_loop(bot, portfolio, whales, session):
     while True:
         await asyncio.sleep(FOLLOWUP_INTERVAL)
+        if PAPER_MODE:
+            continue
         now     = int(time.time())
         to_keep = []
         for item in portfolio:
@@ -1025,10 +1026,11 @@ async def followup_loop(bot, portfolio, whales, session):
                 pair = await get_pair_data(session, item["mint"])
                 if pair:
                     try:
-                        cur   = float(pair.get("priceUsd", 0) or 0)
+                        cur  = float(pair.get("priceUsd", 0) or 0)
                         entry = item["entry_price"]
-                        chg   = ((cur - entry) / entry * 100) if entry > 0 else 0
+                        chg  = ((cur - entry) / entry * 100) if entry > 0 else 0
                         record_whale_result(item.get("holders_snap", []), whales, won=chg >= 30)
+                        save_whales(whales)
                     except Exception:
                         pass
                 continue
@@ -1040,91 +1042,117 @@ async def followup_loop(bot, portfolio, whales, session):
                 entry = item["entry_price"]
                 if entry <= 0:
                     to_keep.append(item); continue
-                chg_pct = (cur - entry) / entry * 100
+                pct      = (cur - entry) / entry * 100
                 dex_link = f"https://dexscreener.com/{item['chain']}/{item['mint']}"
-                if chg_pct >= PUMP_THRESHOLD and not item["pumped_alerted"]:
+                if pct >= PUMP_THRESHOLD and not item["pumped_alerted"]:
                     item["pumped_alerted"] = True
+                    record_whale_result(item.get("holders_snap", []), whales, won=True)
+                    save_whales(whales)
                     await bot.send_message(chat_id=CHAT_ID, text=(
-                        f"PUMP ALERT\n\n"
-                        f"{item['name']} (${item['symbol']}) is up {chg_pct:+.1f}%\n\n"
-                        f"Entry: ${entry:.8f}\nNow: ${cur:.8f}\n\n"
-                        f"Consider taking some profit!\n\n"
+                        f"PUMP ALERT\n\n{item['name']} (${item['symbol']}) is up {pct:+.1f}%\n\n"
+                        f"Entry: ${entry:.8f}\nNow: ${cur:.8f}\n\nConsider taking profit!\n\n"
                         f"DexScreener: {dex_link}"
                     ), disable_web_page_preview=True)
-                    record_whale_result(item.get("holders_snap", []), whales, won=True)
-                if chg_pct <= DUMP_THRESHOLD and not item["dumped_alerted"]:
+                if pct <= DUMP_THRESHOLD and not item["dumped_alerted"]:
                     item["dumped_alerted"] = True
                     await bot.send_message(chat_id=CHAT_ID, text=(
-                        f"DUMP ALERT\n\n"
-                        f"{item['name']} (${item['symbol']}) is down {chg_pct:.1f}%\n\n"
-                        f"Entry: ${entry:.8f}\nNow: ${cur:.8f}\n\n"
-                        f"Consider cutting losses!\n\n"
+                        f"DUMP ALERT\n\n{item['name']} (${item['symbol']}) is down {pct:.1f}%\n\n"
+                        f"Entry: ${entry:.8f}\nNow: ${cur:.8f}\n\nConsider cutting losses!\n\n"
                         f"DexScreener: {dex_link}"
                     ), disable_web_page_preview=True)
                 to_keep.append(item)
             except Exception as e:
-                log.warning("Follow-up error: %s", e)
+                log.warning("Followup error: %s", e)
                 to_keep.append(item)
         portfolio.clear()
         portfolio.extend(to_keep)
+        save_portfolio(portfolio)
 
 
-# ── Daily summary ─────────────────────────────────────────────────────────────
-
+# Daily summary
 async def daily_summary_loop(bot, portfolio, whales, session):
     while True:
         now_utc  = datetime.now(timezone.utc)
         next_8am = now_utc.replace(hour=DAILY_SUMMARY_HOUR, minute=0, second=0, microsecond=0)
         if now_utc >= next_8am:
-            from datetime import timedelta
             next_8am = next_8am + timedelta(days=1)
         await asyncio.sleep((next_8am - now_utc).total_seconds())
         try:
-            today_start = int(time.time()) - 86400
-            todays      = [p for p in portfolio if p.get("alert_time", 0) >= today_start]
-            pumped = dumped = live = 0
-            lines  = []
-            for item in todays:
-                pair = await get_pair_data(session, item["mint"])
-                if pair:
-                    try:
-                        cur  = float(pair.get("priceUsd", 0) or 0)
-                        chg  = ((cur - item["entry_price"]) / item["entry_price"] * 100) if item["entry_price"] > 0 else 0
-                        e    = "💎" if chg >= 50 else ("✅" if chg >= 0 else "❌")
-                        lines.append(f"  {e} ${item['symbol']}: {'+' if chg>=0 else ''}{chg:.1f}%")
-                        if chg >= 30:   pumped += 1
-                        elif chg <= -30:dumped += 1
-                        else:           live   += 1
-                    except Exception:
-                        lines.append(f"  ? ${item['symbol']}: N/A")
             good_whales = sum(1 for w in whales.values() if w.get("wins", 0) >= 2)
-            summary = (
-                f"DAILY SUMMARY\n"
-                f"{now_utc.strftime('%B %d, %Y')}\n\n"
-                f"Gems sent today: {len(todays)}\n"
-                f"Pumped 30%+: {pumped}\n"
-                f"Dumped 30%+: {dumped}\n"
-                f"Still live: {live}\n\n"
-            )
-            if lines:
-                summary += "Performance:\n" + "\n".join(lines) + "\n\n"
-            summary += (
-                f"Whale tracker:\n"
-                f"  Wallets tracked: {len(whales)}\n"
-                f"  Proven winners (2+ wins): {good_whales}\n\n"
-                f"Cloud memory: ACTIVE (Supabase)\n"
-                f"Scanner running 24/7!"
-            )
+
+            if PAPER_MODE:
+                paper       = load_paper()
+                today_start = int(time.time()) - 86400
+                todays      = [t for t in paper if t.get("alert_time", 0) >= today_start]
+                closed      = [t for t in todays if t.get("closed")]
+                wins        = sum(1 for t in closed if (t.get("final_pnl") or 0) > 0)
+                losses      = sum(1 for t in closed if (t.get("final_pnl") or 0) <= 0)
+                today_pnl   = sum(t.get("final_pnl") or 0 for t in closed)
+                all_closed  = [t for t in paper if t.get("closed")]
+                all_pnl     = sum(t.get("final_pnl") or 0 for t in all_closed)
+                all_wins    = sum(1 for t in all_closed if (t.get("final_pnl") or 0) > 0)
+                all_wr      = (all_wins/len(all_closed)*100) if all_closed else 0
+
+                summary = (
+                    f"DAILY SUMMARY - {now_utc.strftime('%B %d, %Y')}\n"
+                    f"PAPER TRADING MODE\n\n"
+                    f"TODAY:\n"
+                    f"Trades: {len(todays)}\n"
+                    f"Won: {wins} | Lost: {losses}\n"
+                    f"Today P&L: {'+'if today_pnl>=0 else ''}EUR{today_pnl:.2f}\n"
+                    f"Open positions: {len(todays)-len(closed)}\n\n"
+                    f"ALL TIME:\n"
+                    f"Total closed trades: {len(all_closed)}\n"
+                    f"Win rate: {all_wr:.0f}%\n"
+                    f"Total fake P&L: {'+'if all_pnl>=0 else ''}EUR{all_pnl:.2f}\n\n"
+                    f"Whale tracker:\n"
+                    f"  Wallets tracked: {len(whales)}\n"
+                    f"  Proven winners: {good_whales}\n\n"
+                    f"Cloud memory: ACTIVE\n"
+                    f"Scanner running 24/7!"
+                )
+            else:
+                today_start = int(time.time()) - 86400
+                todays      = [p for p in portfolio if p.get("alert_time", 0) >= today_start]
+                pumped = dumped = live = 0
+                lines  = []
+                for item in todays:
+                    pair = await get_pair_data(session, item["mint"])
+                    if pair:
+                        try:
+                            cur = float(pair.get("priceUsd", 0) or 0)
+                            chg = ((cur - item["entry_price"]) / item["entry_price"] * 100) if item["entry_price"] > 0 else 0
+                            e   = "WIN" if chg >= 50 else ("OK" if chg >= 0 else "LOSS")
+                            lines.append(f"  {e} ${item['symbol']}: {fmt_pct(chg)}")
+                            if chg >= 30:    pumped += 1
+                            elif chg <= -30: dumped += 1
+                            else:            live   += 1
+                        except Exception:
+                            lines.append(f"  ? ${item['symbol']}: N/A")
+                summary = (
+                    f"DAILY SUMMARY - {now_utc.strftime('%B %d, %Y')}\n\n"
+                    f"Gems sent: {len(todays)}\n"
+                    f"Pumped 30%+: {pumped}\n"
+                    f"Dumped 30%+: {dumped}\n"
+                    f"Still live: {live}\n\n"
+                )
+                if lines:
+                    summary += "Performance:\n" + "\n".join(lines) + "\n\n"
+                summary += (
+                    f"Whale tracker:\n"
+                    f"  Wallets tracked: {len(whales)}\n"
+                    f"  Proven winners: {good_whales}\n\n"
+                    f"Cloud memory: ACTIVE\n"
+                    f"Scanner running 24/7!"
+                )
+
             await bot.send_message(chat_id=CHAT_ID, text=summary, disable_web_page_preview=True)
             log.info("Daily summary sent.")
         except Exception as e:
             log.error("Daily summary error: %s", e)
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
-
-# ── Auto scanner loop ─────────────────────────────────────────────────────────
-
+# Scanner loop
 async def scanner_loop(bot, seen, session, portfolio, whales):
     alerted: set = set()
     while True:
@@ -1143,12 +1171,12 @@ async def scanner_loop(bot, seen, session, portfolio, whales):
                     continue
                 age_min = (int(time.time() * 1000) - created) / 60_000
                 sym = (pair.get("baseToken") or {}).get("symbol", addr[:8])
-                log.info("Checking %s — age: %.1fm", sym, age_min)
+                log.info("Checking %s - age: %.1fm", sym, age_min)
                 if age_min > MAX_AGE_MINUTES:
-                    log.info("Skip %s — too old (%.1fm)", sym, age_min)
+                    log.info("Skip %s - too old (%.1fm)", sym, age_min)
                     continue
                 if age_min < MIN_AGE_MINUTES:
-                    log.info("Skip %s — too fresh (%.1fm)", sym, age_min)
+                    log.info("Skip %s - too fresh (%.1fm)", sym, age_min)
                     continue
                 rug_score, risks, holders, deployer = await get_rugcheck(session, addr)
                 is_graduated     = await is_pumpfun_graduate(session, addr)
@@ -1156,7 +1184,7 @@ async def scanner_loop(bot, seen, session, portfolio, whales):
                 whale_f, whale_d = check_known_whales(holders, whales)
                 passed, reason   = passes_filters(pair, rug_score, holders, deployer, is_graduated, risks)
                 if not passed:
-                    log.info("Filtered: %s — %s", sym, reason)
+                    log.info("Filtered: %s - %s", sym, reason)
                     continue
                 alerted.add(addr)
                 seen.add(addr)
@@ -1169,8 +1197,7 @@ async def scanner_loop(bot, seen, session, portfolio, whales):
         await asyncio.sleep(SCAN_INTERVAL)
 
 
-# ── Group message handler ─────────────────────────────────────────────────────
-
+# Group handler
 def make_group_handler(seen, session, bot, portfolio, whales):
     async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         msg = update.message
@@ -1205,16 +1232,12 @@ def make_group_handler(seen, session, bot, portfolio, whales):
                 sym = (pair.get("baseToken") or {}).get("symbol", query)
                 if not passed:
                     try:
-                        await bot.send_message(
-                            chat_id=CHAT_ID,
-                            text=(
-                                f"GROUP MENTION (failed filters)\n\n"
-                                f"Group: {group_name}\nUser: @{user_name}\n"
-                                f"Coin: {sym} ({query})\nFailed: {reason}\n\n"
-                                f"Message: {text[:200]}"
-                            ),
-                            disable_web_page_preview=True
-                        )
+                        await bot.send_message(chat_id=CHAT_ID, text=(
+                            f"GROUP MENTION (failed filters)\n\n"
+                            f"Group: {group_name}\nUser: @{user_name}\n"
+                            f"Coin: {sym} ({query})\nFailed: {reason}\n\n"
+                            f"Message: {text[:200]}"
+                        ), disable_web_page_preview=True)
                     except TelegramError:
                         pass
                     continue
@@ -1227,8 +1250,7 @@ def make_group_handler(seen, session, bot, portfolio, whales):
     return handle
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
-
+# Entry point
 async def post_init(app):
     session = aiohttp.ClientSession()
     seen, whales, portfolio = await load_all_from_cloud(session)
@@ -1239,26 +1261,30 @@ async def post_init(app):
         filters.TEXT & ~filters.COMMAND,
         make_group_handler(seen, session, bot, portfolio, whales)
     ))
+    mode_str = "PAPER TRADING (no real money)" if PAPER_MODE else "LIVE TRADING"
     try:
         await bot.send_message(chat_id=CHAT_ID, text=(
-            "Memecoin Scanner v5.6 is LIVE\n"
-            "HELIUS LIQUIDITY FIX\n\n"
-            "Key fix: Helius liquidity fallback\n"
-            "When DexScreener shows $0, bot checks\n"
-            "liquidity directly on Solana blockchain.\n\n"
-            "Settings:\n"
-            "- Min liquidity: $7,000\n"
-            "- PumpSwap coins allowed\n"
-            "- Twitter required (no website needed)\n"
-            "- Age window: 3-30 minutes\n\n"
-            "Helius Developer: ACTIVE\n"
-            "Cloud memory: ACTIVE\n"
-            "Group scanner: ACTIVE"
+            f"Memecoin Scanner v5.7 is LIVE\n"
+            f"Mode: {mode_str}\n\n"
+            f"Filter updates:\n"
+            f"- Rug score lowered to 60+ (was 80+)\n"
+            f"- Min market cap: $5,000 (was $10,000)\n"
+            f"- Min liquidity: $7,000\n"
+            f"- Age window: 3-30 minutes\n"
+            f"- Twitter required\n\n"
+            f"Paper trade size: EUR{PAPER_TRADE_SIZE:.0f} per trade\n"
+            f"Take profit: +{PUMP_THRESHOLD:.0f}%\n"
+            f"Stop loss: {DUMP_THRESHOLD:.0f}%\n\n"
+            f"Helius Developer: ACTIVE\n"
+            f"6 whale wallets: TRACKED\n"
+            f"Cloud memory: ACTIVE\n"
+            f"Group scanner: ACTIVE"
         ))
     except TelegramError as e:
         log.error("Startup message failed: %s", e)
     asyncio.create_task(scanner_loop(bot, seen, session, portfolio, whales))
     asyncio.create_task(followup_loop(bot, portfolio, whales, session))
+    asyncio.create_task(paper_followup_loop(bot, session))
     asyncio.create_task(daily_summary_loop(bot, portfolio, whales, session))
     asyncio.create_task(backup_loop(session, seen, whales, portfolio))
 
@@ -1281,7 +1307,7 @@ def main():
         .post_shutdown(post_shutdown)
         .build()
     )
-    log.info("Starting bot v5.6...")
+    log.info("Starting bot v5.7...")
     app.run_polling(allowed_updates=["message"])
 
 
