@@ -1,5 +1,5 @@
 """
-Memecoin Auto-Scanner Bot v5.9.2
+Memecoin Auto-Scanner Bot v5.9.3
 - NEW: self-monitoring watchdog. The bot now watches its own health and
   Telegrams YOU when something looks wrong, so you can bring it to a fix session.
     * per-source dead detection (a source returns 0 for SOURCE_DEAD_MINUTES)
@@ -786,33 +786,48 @@ def record_whale_result(holders, whales, won):
 # Filter logic
 # ─────────────────────────────────────────────
 def passes_filters(pair, rug_score, holders, deployer, is_graduated, risks=None):
+    # v5.9.3: instead of stopping at the FIRST failed filter, collect EVERY
+    # failure so the log shows the full picture (e.g. "FAILED 3/12: ...").
+    # The (passed, reason) return shape is unchanged, and every original
+    # reason-keyword (no Twitter, dev sold, too old, clone wallet) still
+    # appears in the joined reason string, so the scanner's blacklist logic
+    # keeps working exactly as before.
+    fails = []
+
     created_at = pair.get("pairCreatedAt", 0) or 0
     if not created_at:
+        # Age math depends on this, so we still have to bail early here.
         return False, "no creation time"
+
+    # 1-2. Age window
     age_min = (int(time.time() * 1000) - created_at) / 60_000
     if age_min < MIN_AGE_MINUTES:
-        return False, f"too fresh ({int(age_min)}m)"
+        fails.append(f"too fresh ({int(age_min)}m)")
     if age_min > MAX_AGE_MINUTES:
-        return False, f"too old ({int(age_min)}m)"
+        fails.append(f"too old ({int(age_min)}m)")
 
+    # 3-4. Liquidity
     liq = float((pair.get("liquidity") or {}).get("usd", 0) or 0)
     if liq < MIN_LIQUIDITY:
-        return False, f"low liquidity ({fmt_usd(liq)})"
+        fails.append(f"low liquidity ({fmt_usd(liq)})")
     if liq > MAX_LIQUIDITY:
-        return False, f"liquidity too high ({fmt_usd(liq)})"
+        fails.append(f"liquidity too high ({fmt_usd(liq)})")
 
+    # 5. Market cap
     mcap = float(pair.get("fdv", 0) or 0)
     if mcap > 0:
         if mcap < MIN_MCAP:
-            return False, f"mcap too low ({fmt_usd(mcap)})"
+            fails.append(f"mcap too low ({fmt_usd(mcap)})")
         if mcap > MAX_MCAP:
-            return False, f"mcap too high ({fmt_usd(mcap)})"
+            fails.append(f"mcap too high ({fmt_usd(mcap)})")
 
+    # 6. Rug score
     if rug_score == -1:
-        return False, "rug score unavailable"
-    if rug_score < MIN_RUG_SCORE:
-        return False, f"rug score too low ({min(rug_score, 100)})"
+        fails.append("rug score unavailable")
+    elif rug_score < MIN_RUG_SCORE:
+        fails.append(f"rug score too low ({min(rug_score, 100)})")
 
+    # 7. Buy pressure
     txns = (pair.get("txns") or {}).get("h24") or {}
     buys = txns.get("buys", 0)
     sells = txns.get("sells", 0)
@@ -820,32 +835,36 @@ def passes_filters(pair, rug_score, holders, deployer, is_graduated, risks=None)
     if total > 0:
         buy_pct = buys / total * 100
         if buy_pct < MIN_BUY_PRESSURE:
-            return False, f"weak buy pressure ({buy_pct:.0f}%)"
+            fails.append(f"weak buy pressure ({buy_pct:.0f}%)")
 
+    # 8-10. Holder distribution / clone / owner wallets
     if holders:
         top1 = normalize_pct(float(holders[0].get("pct", 0)))
         if top1 >= MAX_TOP_HOLDER:
-            return False, f"top holder {top1:.1f}%"
+            fails.append(f"top holder {top1:.1f}%")
         pcts = [normalize_pct(float(h.get("pct", 0))) for h in holders[:10]]
         top10 = sum(pcts)
         if top10 >= MAX_TOP10:
-            return False, f"top 10 too concentrated ({top10:.1f}%)"
+            fails.append(f"top 10 too concentrated ({top10:.1f}%)")
         if len(pcts) >= 7:
             small = pcts[1:]
             if small and (max(small) - min(small)) <= 0.20:
-                return False, "clone wallet pattern detected"
+                fails.append("clone wallet pattern detected")
         owner_count = sum(1 for h in holders[:10] if h.get("owner") or h.get("insider"))
         if owner_count >= 4:
-            return False, f"too many owner wallets ({owner_count}/10)"
+            fails.append(f"too many owner wallets ({owner_count}/10)")
 
+    # 11. Dev wallet sold
     dev_sold, dev_reason = dev_has_sold(holders, deployer)
     if dev_sold:
-        return False, f"dev sold: {dev_reason}"
+        fails.append(f"dev sold: {dev_reason}")
 
+    # 12. Twitter/X required
     _, twitter = extract_socials(pair)
     if not twitter:
-        return False, "no Twitter/X"
+        fails.append("no Twitter/X")
 
+    # Extra: LP providers (non-PumpSwap), PumpSwap top holder, pump-address
     dex_id = (pair.get("dexId") or "").lower()
     is_pumpswap = "pumpswap" in dex_id or "pump-swap" in dex_id
     if not is_pumpswap:
@@ -853,17 +872,20 @@ def passes_filters(pair, rug_score, holders, deployer, is_graduated, risks=None)
             name = (risk.get("name") or "").lower()
             desc = (risk.get("description") or "").lower()
             if "lp provider" in name or "few users" in desc:
-                return False, "low LP providers"
-
+                fails.append("low LP providers")
+                break
     if is_pumpswap and holders:
         pcts = [normalize_pct(float(h.get("pct", 0))) for h in holders[:10]]
         if pcts and pcts[0] >= 10.0:
-            return False, f"PumpSwap top holder {pcts[0]:.1f}%"
+            fails.append(f"PumpSwap top holder {pcts[0]:.1f}%")
 
     base_addr = (pair.get("baseToken") or {}).get("address", "")
     if base_addr.endswith("pump") and not is_pumpswap:
-        return False, "address ends in pump but not on PumpSwap"
+        fails.append("address ends in pump but not on PumpSwap")
 
+    if fails:
+        # One combined reason string: "FAILED N: reason1 | reason2 | reason3"
+        return False, f"FAILED {len(fails)}: " + " | ".join(fails)
     return True, ""
 
 
@@ -1333,7 +1355,7 @@ async def daily_summary_loop(bot, portfolio, whales, session):
                     f"Whale tracker:\n"
                     f" Wallets tracked: {len(whales)}\n"
                     f" Proven winners: {good_whales}\n\n"
-                    f"v5.9.2 - Watchdog + blacklist ACTIVE\n"
+                    f"v5.9.3 - Watchdog + blacklist ACTIVE\n"
                     f"Cloud memory: ACTIVE\n"
                     f"Scanner running 24/7!"
                 )
@@ -1368,7 +1390,7 @@ async def daily_summary_loop(bot, portfolio, whales, session):
                     f"Whale tracker:\n"
                     f" Wallets tracked: {len(whales)}\n"
                     f" Proven winners: {good_whales}\n\n"
-                    f"v5.9.2 - Watchdog + blacklist ACTIVE\n"
+                    f"v5.9.3 - Watchdog + blacklist ACTIVE\n"
                     f"Cloud memory: ACTIVE\n"
                     f"Scanner running 24/7!"
                 )
@@ -1435,7 +1457,7 @@ async def scanner_loop(bot, seen, session, portfolio, whales):
     pending: dict = {}  # v5.9: mint -> first-seen timestamp_ms (coins waiting to mature)
     while True:
         try:
-            log.info("Scanning... (v5.9.2 watchdog)")
+            log.info("Scanning... (v5.9.3 watchdog)")
             # Sources now return MAX-age-filtered (mint, ts_ms) — includes brand-new coins
             token_list = await get_all_latest_tokens(session, bot)
 
@@ -1635,7 +1657,7 @@ async def post_init(app):
     mode_str = "PAPER TRADING (no real money)" if PAPER_MODE else "LIVE TRADING"
     try:
         await bot.send_message(chat_id=CHAT_ID, text=(
-            f"Memecoin Scanner v5.9.2 is LIVE\n"
+            f"Memecoin Scanner v5.9.3 is LIVE\n"
             f"Mode: {mode_str}\n\n"
             f"v5.9.2 NEW - Self-monitoring watchdog:\n"
             f"- Warns you if any source goes dark {SOURCE_DEAD_MINUTES}m+\n"
@@ -1686,7 +1708,7 @@ def main():
         .post_shutdown(post_shutdown)
         .build()
     )
-    log.info("Starting bot v5.9.2...")
+    log.info("Starting bot v5.9.3...")
     app.run_polling(allowed_updates=["message"])
 
 
