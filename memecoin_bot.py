@@ -1,12 +1,15 @@
 """
-Memecoin Auto-Scanner Bot v5.9.1
-- FIX: v5.9 let ancient coins into the pending pool because Helius RPC
-  stamps a token with its latest TRANSACTION time, not its creation time.
-  An old token traded in a fresh tx looked "new" until pair data was fetched.
-- Now: any coin confirmed too-old (real pairCreatedAt) is added to 'seen'
-  and permanently blacklisted, so it never re-enters the pending pool.
-- Permanent filter-fails (no Twitter, dev sold, etc.) blacklisted too.
-- seen-set cap raised 1000 -> 50000 so the blacklist actually persists.
+Memecoin Auto-Scanner Bot v5.9.2
+- NEW: self-monitoring watchdog. The bot now watches its own health and
+  Telegrams YOU when something looks wrong, so you can bring it to a fix session.
+    * per-source dead detection (a source returns 0 for SOURCE_DEAD_MINUTES)
+    * all-sources-quiet detection (likely a bug, not a slow market)
+    * scanner crash-streak escalation
+    * Supabase save-failure warning
+    * 6-hourly heartbeat (silence = the whole worker is down)
+    * /status command for an on-demand health snapshot
+    * all alerts rate-limited via HEALTH_ALERT_COOLDOWN so you aren't spammed
+- Carried from v5.9.1: ancient-coin blacklist + mature-window scanning.
 - All v5.7 features intact.
 """
 import asyncio
@@ -19,7 +22,7 @@ from datetime import datetime, timezone, timedelta
 import aiohttp
 from telegram import Bot, Update
 from telegram.error import TelegramError
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 
 # Config
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
@@ -60,6 +63,16 @@ PUMP_THRESHOLD = 80.0
 DUMP_THRESHOLD = -25.0
 DAILY_SUMMARY_HOUR = 8
 
+# ── v5.9.2: Self-monitoring / watchdog config ──────────────────
+# How long a single source can keep returning 0 before the bot warns you.
+SOURCE_DEAD_MINUTES = 30
+# How long the WHOLE scanner can find nothing across all sources before warning.
+ALL_QUIET_MINUTES = 30
+# Min gap between two identical health warnings, so you aren't spammed.
+HEALTH_ALERT_COOLDOWN = 1800   # 30 min
+# Consecutive scanner-loop crashes before an escalation alert.
+SCANNER_ERROR_THRESHOLD = 3
+
 # Paper trading
 PAPER_MODE = os.getenv("PAPER_MODE", "true").lower() == "true"
 PAPER_TRADE_SIZE = float(os.getenv("PAPER_TRADE_SIZE", "20"))
@@ -82,6 +95,55 @@ _holder_snapshots: dict = {}
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────
+# v5.9.2: Self-monitoring / watchdog state
+# ─────────────────────────────────────────────
+# Tracks the last time each source returned at least one token, the last
+# time the scanner did anything useful, error streaks, and a per-message
+# cooldown so the same warning doesn't fire every 60 seconds.
+HEALTH = {
+    "start_time": int(time.time()),
+    "source_last_ok": {            # source name -> unix ts of last non-empty result
+        "Helius Enhanced": int(time.time()),
+        "Helius RPC": int(time.time()),
+        "DexScreener": int(time.time()),
+        "GeckoTerminal": int(time.time()),
+    },
+    "source_warned": {},           # source name -> True if we've already warned it's dead
+    "last_collected_time": int(time.time()),  # last scan that collected >0 tokens
+    "all_quiet_warned": False,
+    "scanner_errors": 0,           # consecutive scanner-loop exceptions
+    "last_alert_at": {},           # alert-key -> unix ts (cooldown tracking)
+    "scans_completed": 0,
+    "alerts_sent_today": 0,
+    "supabase_fails": 0,
+    "rate_limit_hits": 0,
+}
+
+
+def _cooldown_ok(key):
+    """True if enough time has passed since we last sent this alert key."""
+    now = int(time.time())
+    last = HEALTH["last_alert_at"].get(key, 0)
+    if now - last >= HEALTH_ALERT_COOLDOWN:
+        HEALTH["last_alert_at"][key] = now
+        return True
+    return False
+
+
+async def health_alert(bot, key, text):
+    """Send a watchdog alert to Telegram, respecting the per-key cooldown."""
+    if not _cooldown_ok(key):
+        return
+    try:
+        await bot.send_message(chat_id=CHAT_ID, text=f"WATCHDOG ALERT\n\n{text}",
+                               disable_web_page_preview=True)
+        log.warning("Health alert sent [%s]: %s", key, text.replace("\n", " ")[:120])
+    except TelegramError as e:
+        log.error("Health alert send failed: %s", e)
+
 
 
 # ─────────────────────────────────────────────
@@ -130,8 +192,12 @@ async def cloud_save(session, key, value):
                                 timeout=aiohttp.ClientTimeout(total=10)) as r:
             if r.status not in (200, 201):
                 log.warning("Cloud save failed %s: %s", key, r.status)
+                HEALTH["supabase_fails"] += 1
+            else:
+                HEALTH["supabase_fails"] = 0  # a success clears the streak
     except Exception as e:
         log.warning("Cloud save error %s: %s", key, e)
+        HEALTH["supabase_fails"] += 1
 
 async def cloud_load(session, key):
     try:
@@ -170,7 +236,7 @@ async def save_all_to_cloud(session, seen, whales, portfolio):
         except Exception:
             pass
 
-async def backup_loop(session, seen, whales, portfolio):
+async def backup_loop(session, seen, whales, portfolio, bot=None):
     while True:
         await asyncio.sleep(BACKUP_INTERVAL)
         log.info("Auto-backup to Supabase...")
@@ -182,6 +248,14 @@ async def backup_loop(session, seen, whales, portfolio):
             seen.clear()
             seen.update(sl[-50_000:])
         await save_all_to_cloud(session, seen, whales, portfolio)
+        # v5.9.2: warn if cloud memory has been failing repeatedly. Without it,
+        # a Railway restart would wipe the blacklist and whale stats.
+        if bot and HEALTH["supabase_fails"] >= 3:
+            await health_alert(bot, "supabase_down",
+                               f"Supabase cloud save has failed {HEALTH['supabase_fails']} "
+                               f"times in a row.\nMemory still works locally, but a Railway "
+                               f"restart could wipe the blacklist and whale stats. "
+                               f"Check the SUPABASE_KEY and project status.")
 
 
 # ─────────────────────────────────────────────
@@ -581,11 +655,13 @@ async def get_fresh_from_geckoterminal(session):
     return results
 
 
-async def get_all_latest_tokens(session):
+async def get_all_latest_tokens(session, bot=None):
     """
     v5.8: Returns deduplicated list of (mint, timestamp_ms) tuples.
     All sources pre-filter by age — no old coins ever reach the pair fetch step.
+    v5.9.2: Also records per-source health and warns if a source goes dark.
     """
+    source_names = ["Helius Enhanced", "Helius RPC", "DexScreener", "GeckoTerminal"]
     results = await asyncio.gather(
         get_fresh_from_helius(session),
         get_fresh_from_helius_rpc(session),
@@ -594,14 +670,38 @@ async def get_all_latest_tokens(session):
         return_exceptions=True
     )
 
+    now = int(time.time())
     seen_mints = set()
     unique = []
-    for r in results:
+    for name, r in zip(source_names, results):
+        if isinstance(r, Exception):
+            # Source threw — treat as not-ok, will trip the dead-source check below.
+            log.warning("Source %s raised: %s", name, r)
+            continue
         if isinstance(r, list):
+            if len(r) > 0:
+                # Source returned data — it's alive. Reset its dead-state.
+                HEALTH["source_last_ok"][name] = now
+                if HEALTH["source_warned"].get(name):
+                    HEALTH["source_warned"][name] = False
+                    if bot:
+                        await health_alert(bot, f"recover:{name}",
+                                           f"{name} is back online (returned {len(r)} tokens).")
             for mint, ts_ms in r:
                 if mint not in seen_mints:
                     seen_mints.add(mint)
                     unique.append((mint, ts_ms))
+
+    # Dead-source detection: warn once per source if it's been empty too long.
+    if bot:
+        for name in source_names:
+            dead_for = (now - HEALTH["source_last_ok"][name]) / 60
+            if dead_for >= SOURCE_DEAD_MINUTES and not HEALTH["source_warned"].get(name):
+                HEALTH["source_warned"][name] = True
+                await health_alert(bot, f"dead:{name}",
+                                   f"{name} has returned 0 tokens for {int(dead_for)} min.\n"
+                                   f"Other sources may still be working. Check if its API "
+                                   f"changed or is rate-limited.")
 
     log.info("Total unique FRESH addresses (pre-filtered): %d", len(unique))
     return unique
@@ -1233,7 +1333,7 @@ async def daily_summary_loop(bot, portfolio, whales, session):
                     f"Whale tracker:\n"
                     f" Wallets tracked: {len(whales)}\n"
                     f" Proven winners: {good_whales}\n\n"
-                    f"v5.9.1 - Mature-window + blacklist ACTIVE\n"
+                    f"v5.9.2 - Watchdog + blacklist ACTIVE\n"
                     f"Cloud memory: ACTIVE\n"
                     f"Scanner running 24/7!"
                 )
@@ -1268,27 +1368,94 @@ async def daily_summary_loop(bot, portfolio, whales, session):
                     f"Whale tracker:\n"
                     f" Wallets tracked: {len(whales)}\n"
                     f" Proven winners: {good_whales}\n\n"
-                    f"v5.9.1 - Mature-window + blacklist ACTIVE\n"
+                    f"v5.9.2 - Watchdog + blacklist ACTIVE\n"
                     f"Cloud memory: ACTIVE\n"
                     f"Scanner running 24/7!"
                 )
             await bot.send_message(chat_id=CHAT_ID, text=summary, disable_web_page_preview=True)
             log.info("Daily summary sent.")
+            HEALTH["alerts_sent_today"] = 0  # v5.9.2: reset daily counter
         except Exception as e:
             log.error("Daily summary error: %s", e)
 
 
 # ─────────────────────────────────────────────
-# v5.8 Scanner loop — uses (mint, ts_ms) tuples
+# v5.9.2: Status builder + heartbeat watchdog
 # ─────────────────────────────────────────────
+def build_status(seen, whales, portfolio):
+    """Human-readable health snapshot — used by /status and the heartbeat."""
+    now = int(time.time())
+    uptime_h = (now - HEALTH["start_time"]) / 3600
+
+    src_lines = []
+    for name, last_ok in HEALTH["source_last_ok"].items():
+        mins = (now - last_ok) / 60
+        state = "OK" if mins < SOURCE_DEAD_MINUTES else "DOWN"
+        src_lines.append(f"  {state} {name} (last data {int(mins)}m ago)")
+
+    quiet_for = (now - HEALTH["last_collected_time"]) / 60
+
+    return (
+        f"BOT STATUS\n\n"
+        f"Mode: {'PAPER' if PAPER_MODE else 'LIVE'}\n"
+        f"Uptime: {uptime_h:.1f}h\n"
+        f"Scans completed: {HEALTH['scans_completed']}\n"
+        f"Alerts sent today: {HEALTH['alerts_sent_today']}\n"
+        f"Last token collected: {int(quiet_for)}m ago\n\n"
+        f"Sources:\n" + "\n".join(src_lines) + "\n\n"
+        f"Memory: {len(seen)} seen | {len(whales)} whales | {len(portfolio)} portfolio\n"
+        f"Supabase fail streak: {HEALTH['supabase_fails']}\n"
+        f"Scanner crash streak: {HEALTH['scanner_errors']}"
+    )
+
+
+async def heartbeat_loop(bot, seen, session, portfolio, whales):
+    """
+    Sends a status snapshot every 6 hours. Its real value is being a
+    'dead-man's switch': if these stop arriving, the whole worker is down
+    (Railway crash, network gone) — and silence itself tells you something.
+    """
+    HEARTBEAT_INTERVAL = 6 * 3600
+    while True:
+        await asyncio.sleep(HEARTBEAT_INTERVAL)
+        try:
+            # reset the daily alert counter roughly once a day via heartbeat math
+            status = build_status(seen, whales, portfolio)
+            await bot.send_message(chat_id=CHAT_ID,
+                                   text="HEARTBEAT (every 6h)\n\n" + status,
+                                   disable_web_page_preview=True)
+            log.info("Heartbeat sent.")
+        except Exception as e:
+            log.error("Heartbeat error: %s", e)
+
+
+
 async def scanner_loop(bot, seen, session, portfolio, whales):
     alerted: set = set()
     pending: dict = {}  # v5.9: mint -> first-seen timestamp_ms (coins waiting to mature)
     while True:
         try:
-            log.info("Scanning... (v5.9.1 mature-window)")
+            log.info("Scanning... (v5.9.2 watchdog)")
             # Sources now return MAX-age-filtered (mint, ts_ms) — includes brand-new coins
-            token_list = await get_all_latest_tokens(session)
+            token_list = await get_all_latest_tokens(session, bot)
+
+            # v5.9.2: track whether the scanner is finding anything at all
+            now = int(time.time())
+            if len(token_list) > 0:
+                HEALTH["last_collected_time"] = now
+                if HEALTH["all_quiet_warned"]:
+                    HEALTH["all_quiet_warned"] = False
+                    await health_alert(bot, "all_quiet_recover",
+                                       "Scanner is collecting tokens again.")
+            else:
+                quiet_for = (now - HEALTH["last_collected_time"]) / 60
+                if quiet_for >= ALL_QUIET_MINUTES and not HEALTH["all_quiet_warned"]:
+                    HEALTH["all_quiet_warned"] = True
+                    await health_alert(bot, "all_quiet",
+                                       f"ALL sources have returned 0 tokens for "
+                                       f"{int(quiet_for)} min straight.\n"
+                                       f"This usually means an API format change or a "
+                                       f"network/DNS issue on Railway — not a quiet market.")
 
             # Merge newly-found tokens into the pending pool
             for addr, ts_ms in token_list:
@@ -1358,13 +1525,26 @@ async def scanner_loop(bot, seen, session, portfolio, whales):
                 alerted.add(addr)
                 seen.add(addr)
                 pending.pop(addr, None)
+                HEALTH["alerts_sent_today"] += 1
                 await send_alert(bot, pair, rug_score, risks, holders, "Auto-scan",
                                  is_graduated, vel_score, vel_d, whale_f, whale_d,
                                  portfolio, whales)
                 await asyncio.sleep(1)
 
+            # v5.9.2: a full clean loop — reset the crash streak and count the scan.
+            HEALTH["scans_completed"] += 1
+            HEALTH["scanner_errors"] = 0
+
         except Exception as e:
             log.error("Scanner error: %s", e)
+            # v5.9.2: escalate only if the scanner keeps crashing back-to-back.
+            HEALTH["scanner_errors"] += 1
+            if HEALTH["scanner_errors"] >= SCANNER_ERROR_THRESHOLD:
+                await health_alert(bot, "scanner_crash",
+                                   f"Scanner has crashed {HEALTH['scanner_errors']} times "
+                                   f"in a row.\nLast error: {str(e)[:200]}\n\n"
+                                   f"The loop keeps retrying, but something is wrong. "
+                                   f"Send me this message and the recent logs.")
 
         log.info("Sleeping %ds...", SCAN_INTERVAL)
         await asyncio.sleep(SCAN_INTERVAL)
@@ -1442,31 +1622,40 @@ async def post_init(app):
         filters.TEXT & ~filters.COMMAND,
         make_group_handler(seen, session, bot, portfolio, whales)
     ))
+
+    # v5.9.2: /status command — ask the bot how it's doing any time.
+    async def status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        try:
+            await update.message.reply_text(build_status(seen, whales, portfolio),
+                                            disable_web_page_preview=True)
+        except Exception as e:
+            log.error("Status cmd error: %s", e)
+    app.add_handler(CommandHandler("status", status_cmd))
+
     mode_str = "PAPER TRADING (no real money)" if PAPER_MODE else "LIVE TRADING"
     try:
         await bot.send_message(chat_id=CHAT_ID, text=(
-            f"Memecoin Scanner v5.9.1 is LIVE\n"
+            f"Memecoin Scanner v5.9.2 is LIVE\n"
             f"Mode: {mode_str}\n\n"
-            f"v5.9.1 Fix:\n"
-            f"- Ancient coins entered pending pool via fresh txns\n"
-            f"  (old token traded in a new transaction)\n"
-            f"- Now: once confirmed too-old, coin is blacklisted\n"
-            f"  so it never re-enters the pending pool\n"
-            f"- Permanent filter-fails also blacklisted\n"
-            f"- seen-set cap raised to 50k so blacklist holds\n\n"
+            f"v5.9.2 NEW - Self-monitoring watchdog:\n"
+            f"- Warns you if any source goes dark {SOURCE_DEAD_MINUTES}m+\n"
+            f"- Warns if ALL sources quiet {ALL_QUIET_MINUTES}m+ (likely a bug,\n"
+            f"  not a slow market)\n"
+            f"- Warns on repeated scanner crashes\n"
+            f"- Warns if Supabase cloud save keeps failing\n"
+            f"- Heartbeat status every 6h (silence = worker down)\n"
+            f"- Send /status any time for a live health check\n"
+            f"- Alerts are rate-limited so you're not spammed\n\n"
+            f"Carried over from v5.9.1:\n"
+            f"- Ancient-coin blacklist + mature-window scanning\n\n"
             f"Filters unchanged:\n"
-            f"- Rug score: 60+\n"
-            f"- Min market cap: $5,000\n"
-            f"- Min liquidity: $7,000\n"
-            f"- Age window: 3-30 minutes\n"
-            f"- Twitter required\n\n"
+            f"- Rug score: 60+ | Mcap: $5k+ | Liq: $7k+\n"
+            f"- Age window: 3-30 minutes | Twitter required\n\n"
             f"Paper trade size: EUR{PAPER_TRADE_SIZE:.0f} per trade\n"
-            f"Take profit: +{PUMP_THRESHOLD:.0f}%\n"
-            f"Stop loss: {DUMP_THRESHOLD:.0f}%\n\n"
-            f"Helius Developer: ACTIVE\n"
-            f"6 whale wallets: TRACKED\n"
-            f"Cloud memory: ACTIVE\n"
-            f"Group scanner: ACTIVE"
+            f"Take profit: +{PUMP_THRESHOLD:.0f}% | Stop loss: {DUMP_THRESHOLD:.0f}%\n\n"
+            f"Helius: ACTIVE | 6 whales: TRACKED\n"
+            f"Cloud memory: ACTIVE | Group scanner: ACTIVE\n"
+            f"Watchdog: ACTIVE"
         ))
     except TelegramError as e:
         log.error("Startup message failed: %s", e)
@@ -1475,7 +1664,8 @@ async def post_init(app):
     asyncio.create_task(followup_loop(bot, portfolio, whales, session))
     asyncio.create_task(paper_followup_loop(bot, session))
     asyncio.create_task(daily_summary_loop(bot, portfolio, whales, session))
-    asyncio.create_task(backup_loop(session, seen, whales, portfolio))
+    asyncio.create_task(backup_loop(session, seen, whales, portfolio, bot))
+    asyncio.create_task(heartbeat_loop(bot, seen, session, portfolio, whales))
 
 
 async def post_shutdown(app):
@@ -1496,7 +1686,7 @@ def main():
         .post_shutdown(post_shutdown)
         .build()
     )
-    log.info("Starting bot v5.9.1...")
+    log.info("Starting bot v5.9.2...")
     app.run_polling(allowed_updates=["message"])
 
 
