@@ -1,16 +1,15 @@
 """
-Memecoin Auto-Scanner Bot v5.9.3
-- NEW: self-monitoring watchdog. The bot now watches its own health and
-  Telegrams YOU when something looks wrong, so you can bring it to a fix session.
-    * per-source dead detection (a source returns 0 for SOURCE_DEAD_MINUTES)
-    * all-sources-quiet detection (likely a bug, not a slow market)
-    * scanner crash-streak escalation
-    * Supabase save-failure warning
-    * 6-hourly heartbeat (silence = the whole worker is down)
-    * /status command for an on-demand health snapshot
-    * all alerts rate-limited via HEALTH_ALERT_COOLDOWN so you aren't spammed
-- Carried from v5.9.1: ancient-coin blacklist + mature-window scanning.
-- All v5.7 features intact.
+Memecoin Quality-Coin Screener v6.0
+- BIG CHANGE: repurposed from a 3-30min fresh-launch sniper into a
+  "quality coin screener". It now finds LIQUID, ACTIVE, non-rug coins
+  that are 2-24h old and sends them to you to CHART by hand. The bot
+  screens for quality; YOU apply your own technical analysis (support/
+  resistance, Fibonacci, multi-timeframe) and decide the entry.
+  Long-only — you cannot short these coins on Solana DEXs.
+- Filter changes: age 2-24h, liquidity $15k-$5M, mcap $50k-$5M,
+  new 24h-volume floor ($50k), buy-pressure filter REMOVED.
+- Everything else from v5.9.3 intact: 'show all failed filters' logging,
+  watchdog/self-monitoring, /status, ancient-coin blacklist, cloud memory.
 """
 import asyncio
 import logging
@@ -47,16 +46,26 @@ SKIP_MINTS = {
 SUPABASE_TABLE = "bot_memory"
 BACKUP_INTERVAL = 300
 SCAN_INTERVAL = 60
-MIN_LIQUIDITY = 7_000
-MAX_LIQUIDITY = 2_000_000
-MIN_AGE_MINUTES = 3
-MAX_AGE_MINUTES = 30
+# ── v6.0: "24h chartable quality coin" defaults ────────────────
+# Goal changed: instead of 3-30min fresh launches (mostly junk, unchartable),
+# find coins 2-24h old that are LIQUID, ACTIVE, and not rugs — so YOU can
+# pull up the chart and apply your own TA (support/resistance, Fibonacci,
+# multi-timeframe) and decide the entry by hand. The bot is a candidate
+# finder; you are the trader.
+MIN_LIQUIDITY = 15_000          # was 7k — quality coins have real liquidity
+MAX_LIQUIDITY = 5_000_000       # was 2M — allow bigger, more established names
+MIN_AGE_MINUTES = 120           # was 3 — min 2h so there's a chartable history
+MAX_AGE_MINUTES = 1440          # was 30 — max 24h
 MAX_TOP_HOLDER = 15.0
 MAX_TOP10 = 40.0
-MIN_BUY_PRESSURE = 55.0
-MIN_MCAP = 5_000
-MAX_MCAP = 500_000
+MIN_BUY_PRESSURE = 55.0         # v6.0: NO LONGER a hard filter (see passes_filters).
+                                # Kept only so the value still prints in alerts.
+MIN_MCAP = 50_000               # was 5k — real coins, not dust
+MAX_MCAP = 5_000_000            # was 500k — allow coins that already showed strength
 MIN_RUG_SCORE = 60
+MIN_VOLUME_24H = 50_000         # v6.0 NEW: proves the coin is ACTIVE, not dead.
+                                # (We can't get total holder count from our data
+                                #  sources, so volume+liquidity is the "alive" proxy.)
 FOLLOWUP_INTERVAL = 60
 FOLLOWUP_DURATION = 3600 * 4
 PUMP_THRESHOLD = 80.0
@@ -827,15 +836,13 @@ def passes_filters(pair, rug_score, holders, deployer, is_graduated, risks=None)
     elif rug_score < MIN_RUG_SCORE:
         fails.append(f"rug score too low ({min(rug_score, 100)})")
 
-    # 7. Buy pressure
-    txns = (pair.get("txns") or {}).get("h24") or {}
-    buys = txns.get("buys", 0)
-    sells = txns.get("sells", 0)
-    total = buys + sells
-    if total > 0:
-        buy_pct = buys / total * 100
-        if buy_pct < MIN_BUY_PRESSURE:
-            fails.append(f"weak buy pressure ({buy_pct:.0f}%)")
+    # 7. v6.0: 24h VOLUME floor — the coin must be ACTIVE / not dead.
+    # (Replaces the old buy-pressure hard filter. Buy pressure is no longer a
+    #  gate because a healthy 24h coin naturally has both buys and sells, and
+    #  because you may be looking to enter on either side.)
+    vol24 = float((pair.get("volume") or {}).get("h24", 0) or 0)
+    if vol24 < MIN_VOLUME_24H:
+        fails.append(f"low 24h volume ({fmt_usd(vol24)}) - likely dead")
 
     # 8-10. Holder distribution / clone / owner wallets
     if holders:
@@ -1103,26 +1110,39 @@ async def send_alert(bot, pair, rug_score, risks, holders, source,
         fake_eur = PAPER_TRADE_SIZE
         liq = fmt_usd(float((pair.get("liquidity") or {}).get("usd", 0) or 0))
         mcap = fmt_usd(float(pair.get("fdv", 0) or 0))
+        vol24 = fmt_usd(float((pair.get("volume") or {}).get("h24", 0) or 0))
         dex_link = f"https://dexscreener.com/{chain}/{mint}"
         _, twitter = extract_socials(pair)
         rating_line, plus_r, minus_r = rate_gem(
             pair, rug_score, holders, risks, "", twitter,
             is_graduated, holder_velocity, velocity_desc, whale_found, whale_desc)
         emoji = "PERFECT" if "PERFECT" in rating_line else ("GOOD" if "GOOD" in rating_line else "RISKY")
+        # v6.0: buy/sell counts shown for context (NOT a filter anymore)
+        txns = (pair.get("txns") or {}).get("h24") or {}
+        b = txns.get("buys", 0); s = txns.get("sells", 0); tot = b + s
+        bs_line = f"{b/tot*100:.0f}% buys ({b}B/{s}S)" if tot else "no txn data"
+        # age for context
+        created = pair.get("pairCreatedAt", 0) or 0
+        age_h = ((int(time.time() * 1000) - created) / 3_600_000) if created else 0
         msg = (
-            "PAPER TRADE - ENTRY (no real money)\n\n"
-            f"Rating: {emoji}\n"
+            "CHART THIS CANDIDATE (passed quality filters)\n\n"
+            f"Quality rating: {emoji}\n"
             f"{rating_line}\n\n"
             f"Coin: {name} (${sym})\n"
             f"Source: {source}\n"
             f"Address: {mint}\n\n"
+            f"Age: {age_h:.1f}h\n"
             f"Price: ${entry_price:.8f}\n"
             f"Liquidity: {liq}\n"
-            f"Market Cap: {mcap}\n\n"
-            f"Fake entry: EUR{fake_eur:.0f}\n"
-            f"Take profit (+80%): EUR{fake_eur*1.8:.0f} (+EUR{fake_eur*0.8:.0f})\n"
-            f"Stop loss (-25%): EUR{fake_eur*0.75:.0f} (-EUR{fake_eur*0.25:.0f})\n\n"
-            f"Monitoring for 4 hours...\n\n"
+            f"Market Cap: {mcap}\n"
+            f"24h Volume: {vol24}\n"
+            f"Buy/Sell (24h): {bs_line}\n\n"
+            "--- YOUR JOB NOW ---\n"
+            "Open the chart. Check support/resistance, Fibonacci,\n"
+            "multiple timeframes. The bot only confirms it's liquid,\n"
+            "active, and not an obvious rug. The entry decision is yours.\n\n"
+            f"Paper-tracking from here at ${entry_price:.8f} so you can\n"
+            "see how flagged candidates perform.\n\n"
             f"DexScreener: {dex_link}"
         )
         try:
@@ -1355,7 +1375,7 @@ async def daily_summary_loop(bot, portfolio, whales, session):
                     f"Whale tracker:\n"
                     f" Wallets tracked: {len(whales)}\n"
                     f" Proven winners: {good_whales}\n\n"
-                    f"v5.9.3 - Watchdog + blacklist ACTIVE\n"
+                    f"v6.0 - 24h quality screener ACTIVE\n"
                     f"Cloud memory: ACTIVE\n"
                     f"Scanner running 24/7!"
                 )
@@ -1390,7 +1410,7 @@ async def daily_summary_loop(bot, portfolio, whales, session):
                     f"Whale tracker:\n"
                     f" Wallets tracked: {len(whales)}\n"
                     f" Proven winners: {good_whales}\n\n"
-                    f"v5.9.3 - Watchdog + blacklist ACTIVE\n"
+                    f"v6.0 - 24h quality screener ACTIVE\n"
                     f"Cloud memory: ACTIVE\n"
                     f"Scanner running 24/7!"
                 )
@@ -1457,7 +1477,7 @@ async def scanner_loop(bot, seen, session, portfolio, whales):
     pending: dict = {}  # v5.9: mint -> first-seen timestamp_ms (coins waiting to mature)
     while True:
         try:
-            log.info("Scanning... (v5.9.3 watchdog)")
+            log.info("Scanning... (v6.0 24h-quality)")
             # Sources now return MAX-age-filtered (mint, ts_ms) — includes brand-new coins
             token_list = await get_all_latest_tokens(session, bot)
 
@@ -1657,27 +1677,28 @@ async def post_init(app):
     mode_str = "PAPER TRADING (no real money)" if PAPER_MODE else "LIVE TRADING"
     try:
         await bot.send_message(chat_id=CHAT_ID, text=(
-            f"Memecoin Scanner v5.9.3 is LIVE\n"
+            f"Memecoin Quality-Coin Screener v6.0 is LIVE\n"
             f"Mode: {mode_str}\n\n"
-            f"v5.9.2 NEW - Self-monitoring watchdog:\n"
-            f"- Warns you if any source goes dark {SOURCE_DEAD_MINUTES}m+\n"
-            f"- Warns if ALL sources quiet {ALL_QUIET_MINUTES}m+ (likely a bug,\n"
-            f"  not a slow market)\n"
-            f"- Warns on repeated scanner crashes\n"
-            f"- Warns if Supabase cloud save keeps failing\n"
-            f"- Heartbeat status every 6h (silence = worker down)\n"
-            f"- Send /status any time for a live health check\n"
-            f"- Alerts are rate-limited so you're not spammed\n\n"
-            f"Carried over from v5.9.1:\n"
-            f"- Ancient-coin blacklist + mature-window scanning\n\n"
-            f"Filters unchanged:\n"
-            f"- Rug score: 60+ | Mcap: $5k+ | Liq: $7k+\n"
-            f"- Age window: 3-30 minutes | Twitter required\n\n"
-            f"Paper trade size: EUR{PAPER_TRADE_SIZE:.0f} per trade\n"
-            f"Take profit: +{PUMP_THRESHOLD:.0f}% | Stop loss: {DUMP_THRESHOLD:.0f}%\n\n"
-            f"Helius: ACTIVE | 6 whales: TRACKED\n"
-            f"Cloud memory: ACTIVE | Group scanner: ACTIVE\n"
-            f"Watchdog: ACTIVE"
+            f"NEW PURPOSE (v6.0):\n"
+            f"This is no longer a fresh-launch sniper. It now finds\n"
+            f"LIQUID, ACTIVE, non-rug coins 2-24h old and sends them to\n"
+            f"you to CHART. The bot screens for quality; YOU apply your\n"
+            f"TA (support/resistance, Fibonacci, timeframes) and decide\n"
+            f"the entry. Long-only (you can't short these coins).\n\n"
+            f"Quality filters (v6.0):\n"
+            f"- Age: 2-24 hours (chartable history)\n"
+            f"- Liquidity: $15k - $5M\n"
+            f"- Market cap: $50k - $5M\n"
+            f"- 24h volume: $50k+ (must be active, not dead)\n"
+            f"- Rug score: 60+ | Top holder <15% | Top 10 <40%\n"
+            f"- Twitter required | dev-sold & clone checks on\n"
+            f"- Buy-pressure filter REMOVED (healthy coins have both\n"
+            f"  buys and sells; shown in alert as info only)\n\n"
+            f"Still active: watchdog, /status, blacklist, cloud memory,\n"
+            f"6h heartbeat, group scanner, self-monitoring.\n\n"
+            f"Note: first scans may show extra 'too old' rejections as\n"
+            f"the blacklist fills — that's expected and self-corrects.\n\n"
+            f"Watchdog: ACTIVE | Helius: ACTIVE | Cloud memory: ACTIVE"
         ))
     except TelegramError as e:
         log.error("Startup message failed: %s", e)
@@ -1708,7 +1729,7 @@ def main():
         .post_shutdown(post_shutdown)
         .build()
     )
-    log.info("Starting bot v5.9.3...")
+    log.info("Starting bot v6.0...")
     app.run_polling(allowed_updates=["message"])
 
 
