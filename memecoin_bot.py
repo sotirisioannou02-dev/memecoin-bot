@@ -1,13 +1,14 @@
 """
-Memecoin Quality-Coin Screener v6.0
-- BIG CHANGE: repurposed from a 3-30min fresh-launch sniper into a
+Memecoin Quality-Coin Screener v6.0.1
+- v6.0.1 tweaks: max age 24h -> 48h, top-holder cap 15% -> 10%.
+- BIG CHANGE (v6.0): repurposed from a 3-30min fresh-launch sniper into a
   "quality coin screener". It now finds LIQUID, ACTIVE, non-rug coins
-  that are 2-24h old and sends them to you to CHART by hand. The bot
+  that are 2-48h old and sends them to you to CHART by hand. The bot
   screens for quality; YOU apply your own technical analysis (support/
   resistance, Fibonacci, multi-timeframe) and decide the entry.
   Long-only — you cannot short these coins on Solana DEXs.
-- Filter changes: age 2-24h, liquidity $15k-$5M, mcap $50k-$5M,
-  new 24h-volume floor ($50k), buy-pressure filter REMOVED.
+- Filters: age 2-48h, liquidity $15k-$5M, mcap $50k-$5M, 24h-volume
+  floor $50k, top holder <10%, top 10 <40%, buy-pressure filter REMOVED.
 - Everything else from v5.9.3 intact: 'show all failed filters' logging,
   watchdog/self-monitoring, /status, ancient-coin blacklist, cloud memory.
 """
@@ -55,8 +56,8 @@ SCAN_INTERVAL = 60
 MIN_LIQUIDITY = 15_000          # was 7k — quality coins have real liquidity
 MAX_LIQUIDITY = 5_000_000       # was 2M — allow bigger, more established names
 MIN_AGE_MINUTES = 120           # was 3 — min 2h so there's a chartable history
-MAX_AGE_MINUTES = 1440          # was 30 — max 24h
-MAX_TOP_HOLDER = 15.0
+MAX_AGE_MINUTES = 2880          # v6.0.1: max 48h (was 24h)
+MAX_TOP_HOLDER = 10.0           # v6.0.1: tightened from 15% (less whale risk)
 MAX_TOP10 = 40.0
 MIN_BUY_PRESSURE = 55.0         # v6.0: NO LONGER a hard filter (see passes_filters).
                                 # Kept only so the value still prints in alerts.
@@ -1375,7 +1376,7 @@ async def daily_summary_loop(bot, portfolio, whales, session):
                     f"Whale tracker:\n"
                     f" Wallets tracked: {len(whales)}\n"
                     f" Proven winners: {good_whales}\n\n"
-                    f"v6.0 - 24h quality screener ACTIVE\n"
+                    f"v6.0.1 - 48h quality screener ACTIVE\n"
                     f"Cloud memory: ACTIVE\n"
                     f"Scanner running 24/7!"
                 )
@@ -1410,7 +1411,7 @@ async def daily_summary_loop(bot, portfolio, whales, session):
                     f"Whale tracker:\n"
                     f" Wallets tracked: {len(whales)}\n"
                     f" Proven winners: {good_whales}\n\n"
-                    f"v6.0 - 24h quality screener ACTIVE\n"
+                    f"v6.0.1 - 48h quality screener ACTIVE\n"
                     f"Cloud memory: ACTIVE\n"
                     f"Scanner running 24/7!"
                 )
@@ -1477,7 +1478,7 @@ async def scanner_loop(bot, seen, session, portfolio, whales):
     pending: dict = {}  # v5.9: mint -> first-seen timestamp_ms (coins waiting to mature)
     while True:
         try:
-            log.info("Scanning... (v6.0 24h-quality)")
+            log.info("Scanning... (v6.0.1 48h-quality)")
             # Sources now return MAX-age-filtered (mint, ts_ms) — includes brand-new coins
             token_list = await get_all_latest_tokens(session, bot)
 
@@ -1677,7 +1678,7 @@ async def post_init(app):
     mode_str = "PAPER TRADING (no real money)" if PAPER_MODE else "LIVE TRADING"
     try:
         await bot.send_message(chat_id=CHAT_ID, text=(
-            f"Memecoin Quality-Coin Screener v6.0 is LIVE\n"
+            f"Memecoin Quality-Coin Screener v6.0.1 is LIVE\n"
             f"Mode: {mode_str}\n\n"
             f"NEW PURPOSE (v6.0):\n"
             f"This is no longer a fresh-launch sniper. It now finds\n"
@@ -1686,11 +1687,11 @@ async def post_init(app):
             f"TA (support/resistance, Fibonacci, timeframes) and decide\n"
             f"the entry. Long-only (you can't short these coins).\n\n"
             f"Quality filters (v6.0):\n"
-            f"- Age: 2-24 hours (chartable history)\n"
+            f"- Age: 2-48 hours (chartable history)\n"
             f"- Liquidity: $15k - $5M\n"
             f"- Market cap: $50k - $5M\n"
             f"- 24h volume: $50k+ (must be active, not dead)\n"
-            f"- Rug score: 60+ | Top holder <15% | Top 10 <40%\n"
+            f"- Rug score: 60+ | Top holder <10% | Top 10 <40%\n"
             f"- Twitter required | dev-sold & clone checks on\n"
             f"- Buy-pressure filter REMOVED (healthy coins have both\n"
             f"  buys and sells; shown in alert as info only)\n\n"
@@ -1729,7 +1730,7 @@ def main():
         .post_shutdown(post_shutdown)
         .build()
     )
-    log.info("Starting bot v6.0...")
+    log.info("Starting bot v6.0.1...")
     app.run_polling(allowed_updates=["message"])
 
 
