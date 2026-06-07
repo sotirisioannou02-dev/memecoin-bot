@@ -1,10 +1,12 @@
 """
-Memecoin Auto-Scanner Bot v5.9
-- FIX: v5.8 returned 0 because min-age was filtered at the source,
-  discarding brand-new coins before they could mature into the window.
-- Sources now filter by MAX age only; coins are held in a 'pending' pool
-  and re-checked each scan until they enter the 3-30m window.
-- Still skips ancient coins (the original v5.8 goal) — no wasted API calls.
+Memecoin Auto-Scanner Bot v5.9.1
+- FIX: v5.9 let ancient coins into the pending pool because Helius RPC
+  stamps a token with its latest TRANSACTION time, not its creation time.
+  An old token traded in a fresh tx looked "new" until pair data was fetched.
+- Now: any coin confirmed too-old (real pairCreatedAt) is added to 'seen'
+  and permanently blacklisted, so it never re-enters the pending pool.
+- Permanent filter-fails (no Twitter, dev sold, etc.) blacklisted too.
+- seen-set cap raised 1000 -> 50000 so the blacklist actually persists.
 - All v5.7 features intact.
 """
 import asyncio
@@ -172,10 +174,13 @@ async def backup_loop(session, seen, whales, portfolio):
     while True:
         await asyncio.sleep(BACKUP_INTERVAL)
         log.info("Auto-backup to Supabase...")
-        if len(seen) > 1000:
+        # v5.9.1: cap raised from 1000 -> 50000. The blacklist of ancient coins
+        # lives in 'seen', and a 1000 cap got flushed within minutes, letting
+        # old coins re-enter the pending pool. 50k addrs is only ~2MB.
+        if len(seen) > 50_000:
             sl = list(seen)
             seen.clear()
-            seen.update(sl[-1000:])
+            seen.update(sl[-50_000:])
         await save_all_to_cloud(session, seen, whales, portfolio)
 
 
@@ -1228,7 +1233,7 @@ async def daily_summary_loop(bot, portfolio, whales, session):
                     f"Whale tracker:\n"
                     f" Wallets tracked: {len(whales)}\n"
                     f" Proven winners: {good_whales}\n\n"
-                    f"v5.9 - Mature-window scanning ACTIVE\n"
+                    f"v5.9.1 - Mature-window + blacklist ACTIVE\n"
                     f"Cloud memory: ACTIVE\n"
                     f"Scanner running 24/7!"
                 )
@@ -1263,7 +1268,7 @@ async def daily_summary_loop(bot, portfolio, whales, session):
                     f"Whale tracker:\n"
                     f" Wallets tracked: {len(whales)}\n"
                     f" Proven winners: {good_whales}\n\n"
-                    f"v5.9 - Mature-window scanning ACTIVE\n"
+                    f"v5.9.1 - Mature-window + blacklist ACTIVE\n"
                     f"Cloud memory: ACTIVE\n"
                     f"Scanner running 24/7!"
                 )
@@ -1281,7 +1286,7 @@ async def scanner_loop(bot, seen, session, portfolio, whales):
     pending: dict = {}  # v5.9: mint -> first-seen timestamp_ms (coins waiting to mature)
     while True:
         try:
-            log.info("Scanning... (v5.9 mature-window)")
+            log.info("Scanning... (v5.9.1 mature-window)")
             # Sources now return MAX-age-filtered (mint, ts_ms) — includes brand-new coins
             token_list = await get_all_latest_tokens(session)
 
@@ -1322,8 +1327,9 @@ async def scanner_loop(bot, seen, session, portfolio, whales):
                 log.info("Checking %s - age: %.1fm", sym, age_min)
 
                 if age_min > MAX_AGE_MINUTES:
-                    log.info("Skip %s - too old (%.1fm)", sym, age_min)
+                    log.info("Skip %s - too old (%.1fm) [blacklisted]", sym, age_min)
                     pending.pop(addr, None)
+                    seen.add(addr)  # v5.9.1: permanently ignore — stops re-entry from source
                     continue
                 if age_min < MIN_AGE_MINUTES:
                     log.info("Skip %s - too fresh (%.1fm), keeping for next scan", sym, age_min)
@@ -1339,6 +1345,14 @@ async def scanner_loop(bot, seen, session, portfolio, whales):
                 if not passed:
                     log.info("Filtered: %s - %s", sym, reason)
                     pending.pop(addr, None)
+                    # v5.9.1: blacklist permanent fails so they don't re-enter from source.
+                    # Temporary fails (buy pressure, holder counts) get another chance
+                    # if the coin is still inside the window next scan.
+                    permanent = ("no Twitter" in reason or "dev sold" in reason
+                                 or "ends in pump" in reason or "too old" in reason
+                                 or "clone wallet" in reason)
+                    if permanent:
+                        seen.add(addr)
                     continue
 
                 alerted.add(addr)
@@ -1431,13 +1445,15 @@ async def post_init(app):
     mode_str = "PAPER TRADING (no real money)" if PAPER_MODE else "LIVE TRADING"
     try:
         await bot.send_message(chat_id=CHAT_ID, text=(
-            f"Memecoin Scanner v5.9 is LIVE\n"
+            f"Memecoin Scanner v5.9.1 is LIVE\n"
             f"Mode: {mode_str}\n\n"
-            f"v5.9 Fix:\n"
-            f"- v5.8 returned 0 (min-age killed new coins at source)\n"
-            f"- Now: sources keep brand-new coins, hold them in a\n"
-            f"  pending pool, alert when they hit 3-30m\n"
-            f"- Still skips ancient coins (no wasted API calls)\n\n"
+            f"v5.9.1 Fix:\n"
+            f"- Ancient coins entered pending pool via fresh txns\n"
+            f"  (old token traded in a new transaction)\n"
+            f"- Now: once confirmed too-old, coin is blacklisted\n"
+            f"  so it never re-enters the pending pool\n"
+            f"- Permanent filter-fails also blacklisted\n"
+            f"- seen-set cap raised to 50k so blacklist holds\n\n"
             f"Filters unchanged:\n"
             f"- Rug score: 60+\n"
             f"- Min market cap: $5,000\n"
@@ -1480,7 +1496,7 @@ def main():
         .post_shutdown(post_shutdown)
         .build()
     )
-    log.info("Starting bot v5.9...")
+    log.info("Starting bot v5.9.1...")
     app.run_polling(allowed_updates=["message"])
 
 
