@@ -1,8 +1,11 @@
 """
-Memecoin Auto-Scanner Bot v5.8
-- Pre-filter by age BEFORE fetching pair data (massive performance boost)
-- No more wasting API calls on 1,000,000 minute old coins
-- All v5.7 features intact
+Memecoin Auto-Scanner Bot v5.9
+- FIX: v5.8 returned 0 because min-age was filtered at the source,
+  discarding brand-new coins before they could mature into the window.
+- Sources now filter by MAX age only; coins are held in a 'pending' pool
+  and re-checked each scan until they enter the 3-30m window.
+- Still skips ancient coins (the original v5.8 goal) — no wasted API calls.
+- All v5.7 features intact.
 """
 import asyncio
 import logging
@@ -351,11 +354,23 @@ async def is_pumpfun_graduate(session, mint):
 # Now:        get address WITH timestamp → check age → only fetch if fresh ✅
 # ─────────────────────────────────────────────
 def is_age_in_window(timestamp_ms):
-    """Quick age check using only a timestamp — no API call needed."""
+    """Full window check (min AND max) — used at scanner stage right before alerting."""
     if not timestamp_ms:
         return False
     age_min = (int(time.time() * 1000) - timestamp_ms) / 60_000
     return MIN_AGE_MINUTES <= age_min <= MAX_AGE_MINUTES
+
+def is_not_too_old(timestamp_ms):
+    """
+    v5.9: Source-level check — MAX age only.
+    Brand-new coins (seconds old) MUST be collected now so they can
+    mature into the 3-30m window. The min-age check happens later at
+    the scanner stage. Filtering min-age here is what made v5.8 return 0.
+    """
+    if not timestamp_ms:
+        return False
+    age_min = (int(time.time() * 1000) - timestamp_ms) / 60_000
+    return age_min <= MAX_AGE_MINUTES
 
 
 # ─────────────────────────────────────────────
@@ -366,7 +381,6 @@ async def get_fresh_from_helius(session):
     results = []
     now_s = int(time.time())
     max_age_s = MAX_AGE_MINUTES * 60
-    min_age_s = MIN_AGE_MINUTES * 60
 
     programs = [
         (RAYDIUM_AMM, "Raydium AMM"),
@@ -385,9 +399,11 @@ async def get_fresh_from_helius(session):
                 fresh = 0
                 for tx in txs:
                     ts = tx.get("timestamp", 0) or 0
+                    if ts <= 0:
+                        continue
                     age_s = now_s - ts
-                    # Pre-filter by age RIGHT HERE — no pair fetch needed
-                    if age_s < min_age_s or age_s > max_age_s:
+                    # v5.9: MAX age only — let brand-new coins through to mature
+                    if age_s > max_age_s:
                         continue
                     ts_ms = ts * 1000
                     for transfer in (tx.get("tokenTransfers") or []):
@@ -409,7 +425,6 @@ async def get_fresh_from_helius_rpc(session):
     results = []
     now_s = int(time.time())
     max_age_s = MAX_AGE_MINUTES * 60
-    min_age_s = MIN_AGE_MINUTES * 60
 
     async def fetch_sigs(program):
         payload = {
@@ -422,12 +437,13 @@ async def get_fresh_from_helius_rpc(session):
                                     timeout=aiohttp.ClientTimeout(total=10)) as r:
                 if r.status == 200:
                     data = await r.json()
-                    # Pre-filter signatures by blockTime before fetching transactions
+                    # v5.9: MAX age only on signatures (let new coins mature)
                     return [
                         (s["signature"], s.get("blockTime", 0))
                         for s in (data.get("result") or [])
                         if not s.get("err")
-                        and min_age_s <= abs(now_s - (s.get("blockTime") or 0)) <= max_age_s
+                        and (s.get("blockTime") or 0) > 0
+                        and abs(now_s - (s.get("blockTime") or 0)) <= max_age_s
                     ]
         except Exception:
             pass
@@ -485,7 +501,6 @@ async def get_fresh_from_dexscreener(session):
     results = []
     now_ms = int(time.time() * 1000)
     max_age_ms = MAX_AGE_MINUTES * 60 * 1000
-    min_age_ms = MIN_AGE_MINUTES * 60 * 1000
 
     for url in [
         "https://api.dexscreener.com/latest/dex/pairs/solana/raydium",
@@ -502,8 +517,8 @@ async def get_fresh_from_dexscreener(session):
                 if not created:
                     continue
                 age_ms = now_ms - created
-                # Pre-filter by age — skip old coins immediately, no extra API call
-                if not (min_age_ms <= age_ms <= max_age_ms):
+                # v5.9: MAX age only — keep brand-new pairs so they can mature
+                if age_ms > max_age_ms or age_ms < 0:
                     continue
                 addr = (pair.get("baseToken") or {}).get("address", "")
                 sym = (pair.get("baseToken") or {}).get("symbol", "???")
@@ -544,8 +559,8 @@ async def get_fresh_from_geckoterminal(session):
                     try:
                         created_dt = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
                         age_min = (now_utc - created_dt).total_seconds() / 60
-                        # Pre-filter by age — skip immediately if out of window
-                        if not (MIN_AGE_MINUTES <= age_min <= MAX_AGE_MINUTES):
+                        # v5.9: MAX age only — keep new pools so they can mature
+                        if age_min > MAX_AGE_MINUTES or age_min < 0:
                             continue
                         ts_ms = int(created_dt.timestamp() * 1000)
                         if addr not in SKIP_MINTS:
@@ -1213,7 +1228,7 @@ async def daily_summary_loop(bot, portfolio, whales, session):
                     f"Whale tracker:\n"
                     f" Wallets tracked: {len(whales)}\n"
                     f" Proven winners: {good_whales}\n\n"
-                    f"v5.8 - Pre-filtered scanning ACTIVE\n"
+                    f"v5.9 - Mature-window scanning ACTIVE\n"
                     f"Cloud memory: ACTIVE\n"
                     f"Scanner running 24/7!"
                 )
@@ -1248,7 +1263,7 @@ async def daily_summary_loop(bot, portfolio, whales, session):
                     f"Whale tracker:\n"
                     f" Wallets tracked: {len(whales)}\n"
                     f" Proven winners: {good_whales}\n\n"
-                    f"v5.8 - Pre-filtered scanning ACTIVE\n"
+                    f"v5.9 - Mature-window scanning ACTIVE\n"
                     f"Cloud memory: ACTIVE\n"
                     f"Scanner running 24/7!"
                 )
@@ -1263,23 +1278,37 @@ async def daily_summary_loop(bot, portfolio, whales, session):
 # ─────────────────────────────────────────────
 async def scanner_loop(bot, seen, session, portfolio, whales):
     alerted: set = set()
+    pending: dict = {}  # v5.9: mint -> first-seen timestamp_ms (coins waiting to mature)
     while True:
         try:
-            log.info("Scanning... (v5.8 pre-filtered)")
-            # get_all_latest_tokens now returns (mint, ts_ms) — already age-filtered
+            log.info("Scanning... (v5.9 mature-window)")
+            # Sources now return MAX-age-filtered (mint, ts_ms) — includes brand-new coins
             token_list = await get_all_latest_tokens(session)
-            log.info("Collected %d pre-filtered addresses.", len(token_list))
 
+            # Merge newly-found tokens into the pending pool
             for addr, ts_ms in token_list:
                 if addr in alerted or addr in seen:
                     continue
+                if addr not in pending:
+                    pending[addr] = ts_ms
 
-                # Double-check age is still valid (time passes during scan)
-                if not is_age_in_window(ts_ms):
-                    log.info("Skip %s - age window passed during scan", addr[:8])
+            log.info("Collected %d new | %d pending in window-wait", len(token_list), len(pending))
+
+            # Clean out anything that aged past MAX while waiting
+            stale = [a for a, ts in pending.items()
+                     if (int(time.time() * 1000) - ts) / 60_000 > MAX_AGE_MINUTES]
+            for a in stale:
+                del pending[a]
+
+            # Check every pending coin that has now matured into the 3-30m window
+            ready = [a for a, ts in pending.items() if is_age_in_window(ts)]
+            log.info("%d coins matured into 3-%dm window", len(ready), MAX_AGE_MINUTES)
+
+            for addr in ready:
+                if addr in alerted or addr in seen:
+                    pending.pop(addr, None)
                     continue
 
-                # Now fetch pair data — only for genuinely fresh tokens
                 pair = await get_pair_data(session, addr)
                 if not pair:
                     continue
@@ -1294,9 +1323,10 @@ async def scanner_loop(bot, seen, session, portfolio, whales):
 
                 if age_min > MAX_AGE_MINUTES:
                     log.info("Skip %s - too old (%.1fm)", sym, age_min)
+                    pending.pop(addr, None)
                     continue
                 if age_min < MIN_AGE_MINUTES:
-                    log.info("Skip %s - too fresh (%.1fm)", sym, age_min)
+                    log.info("Skip %s - too fresh (%.1fm), keeping for next scan", sym, age_min)
                     continue
 
                 rug_score, risks, holders, deployer = await get_rugcheck(session, addr)
@@ -1308,10 +1338,12 @@ async def scanner_loop(bot, seen, session, portfolio, whales):
                                                 is_graduated, risks)
                 if not passed:
                     log.info("Filtered: %s - %s", sym, reason)
+                    pending.pop(addr, None)
                     continue
 
                 alerted.add(addr)
                 seen.add(addr)
+                pending.pop(addr, None)
                 await send_alert(bot, pair, rug_score, risks, holders, "Auto-scan",
                                  is_graduated, vel_score, vel_d, whale_f, whale_d,
                                  portfolio, whales)
@@ -1399,13 +1431,13 @@ async def post_init(app):
     mode_str = "PAPER TRADING (no real money)" if PAPER_MODE else "LIVE TRADING"
     try:
         await bot.send_message(chat_id=CHAT_ID, text=(
-            f"Memecoin Scanner v5.8 is LIVE\n"
+            f"Memecoin Scanner v5.9 is LIVE\n"
             f"Mode: {mode_str}\n\n"
-            f"v5.8 Upgrade:\n"
-            f"- Pre-filtered scanning (MAJOR speed boost)\n"
-            f"- Age check BEFORE API calls — no more wasted requests\n"
-            f"- Only genuinely fresh tokens reach pair fetch\n"
-            f"- 90%+ less wasted API calls on old coins\n\n"
+            f"v5.9 Fix:\n"
+            f"- v5.8 returned 0 (min-age killed new coins at source)\n"
+            f"- Now: sources keep brand-new coins, hold them in a\n"
+            f"  pending pool, alert when they hit 3-30m\n"
+            f"- Still skips ancient coins (no wasted API calls)\n\n"
             f"Filters unchanged:\n"
             f"- Rug score: 60+\n"
             f"- Min market cap: $5,000\n"
@@ -1448,7 +1480,7 @@ def main():
         .post_shutdown(post_shutdown)
         .build()
     )
-    log.info("Starting bot v5.8...")
+    log.info("Starting bot v5.9...")
     app.run_polling(allowed_updates=["message"])
 
 
