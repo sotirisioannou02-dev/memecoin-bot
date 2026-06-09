@@ -1,6 +1,15 @@
 """
-Memecoin Quality-Coin Screener v6.0.2
-- Settings for finding chartable, active, well-distributed coins:
+Memecoin Quality-Coin Screener v6.0.3
+- v6.0.3 EFFICIENCY FIX (no filter/strategy changes): at a 24h window the
+  Helius sources surface tons of old-but-active coins, which flooded the bot
+  with wasteful "Helius liquidity fallback" lookups. Three fixes:
+    1. Per-scan processing cap (MAX_CHECKS_PER_SCAN) bounds work each cycle;
+       the blacklist drains the backlog over a few scans.
+    2. Cheap age pre-check (DexScreener only, no Helius fallback) rejects
+       too-old coins before spending the extra Helius call.
+    3. Full data + rugcheck run only AFTER a coin passes the age gate.
+    Also fixed the misleading "3-1440m" log to show the real MIN_AGE.
+- Strategy / filters unchanged from v6.0.2:
     * Age: 2-24h (enough history to read support/resistance + Fibonacci)
     * Min market cap: $100k     Max: $5M
     * Min liquidity: $30k       Max: $5M
@@ -83,6 +92,12 @@ ALL_QUIET_MINUTES = 30
 HEALTH_ALERT_COOLDOWN = 1800   # 30 min
 # Consecutive scanner-loop crashes before an escalation alert.
 SCANNER_ERROR_THRESHOLD = 3
+# v6.0.3: cap how many matured coins we fully process per scan. At a 24h
+# window the Helius sources surface tons of old-but-active coins; without a
+# cap the bot grinds through hundreds per scan and burns API calls. The
+# blacklist absorbs the rejects over a few scans, so the backlog drains
+# and steady-state stays clean.
+MAX_CHECKS_PER_SCAN = 40
 
 # Paper trading
 PAPER_MODE = os.getenv("PAPER_MODE", "true").lower() == "true"
@@ -372,14 +387,19 @@ async def get_raydium_liquidity_helius(session, mint):
         log.warning("Helius liquidity error: %s", e)
     return 0
 
-async def get_pair_data(session, address):
+async def get_pair_data(session, address, skip_liq_fallback=False):
+    # v6.0.3: skip_liq_fallback lets the scanner do a CHEAP age check first
+    # (DexScreener only, no Helius lookup) and reject too-old coins before
+    # spending an extra Helius call on liquidity. This kills the flood of
+    # "Helius liquidity fallback" lines on coins that are about to be
+    # rejected as too-old anyway.
     data = await fetch_json(session, DEXSCREENER_PAIRS.format(address=address))
     if data:
         pairs = data.get("pairs") or []
         if pairs:
             best = max(pairs, key=lambda p: float((p.get("liquidity") or {}).get("usd", 0) or 0))
             liq = float((best.get("liquidity") or {}).get("usd", 0) or 0)
-            if liq == 0:
+            if liq == 0 and not skip_liq_fallback:
                 hl = await get_raydium_liquidity_helius(session, address)
                 if hl > 0:
                     log.info("Helius liquidity fallback: %s $%.0f", address[:8], hl)
@@ -1377,7 +1397,7 @@ async def daily_summary_loop(bot, portfolio, whales, session):
                     f"Whale tracker:\n"
                     f" Wallets tracked: {len(whales)}\n"
                     f" Proven winners: {good_whales}\n\n"
-                    f"v6.0.2 - 24h quality screener ACTIVE\n"
+                    f"v6.0.3 - 24h quality screener ACTIVE\n"
                     f"Cloud memory: ACTIVE\n"
                     f"Scanner running 24/7!"
                 )
@@ -1412,7 +1432,7 @@ async def daily_summary_loop(bot, portfolio, whales, session):
                     f"Whale tracker:\n"
                     f" Wallets tracked: {len(whales)}\n"
                     f" Proven winners: {good_whales}\n\n"
-                    f"v6.0.2 - 24h quality screener ACTIVE\n"
+                    f"v6.0.3 - 24h quality screener ACTIVE\n"
                     f"Cloud memory: ACTIVE\n"
                     f"Scanner running 24/7!"
                 )
@@ -1479,7 +1499,7 @@ async def scanner_loop(bot, seen, session, portfolio, whales):
     pending: dict = {}  # v5.9: mint -> first-seen timestamp_ms (coins waiting to mature)
     while True:
         try:
-            log.info("Scanning... (v6.0.2 24h-quality)")
+            log.info("Scanning... (v6.0.3 24h-quality)")
             # Sources now return MAX-age-filtered (mint, ts_ms) — includes brand-new coins
             token_list = await get_all_latest_tokens(session, bot)
 
@@ -1516,35 +1536,53 @@ async def scanner_loop(bot, seen, session, portfolio, whales):
             for a in stale:
                 del pending[a]
 
-            # Check every pending coin that has now matured into the 3-30m window
+            # Check pending coins that have matured into the window.
             ready = [a for a, ts in pending.items() if is_age_in_window(ts)]
-            log.info("%d coins matured into 3-%dm window", len(ready), MAX_AGE_MINUTES)
+            log.info("%d coins matured into %d-%dm window (processing up to %d this scan)",
+                     len(ready), MIN_AGE_MINUTES, MAX_AGE_MINUTES, MAX_CHECKS_PER_SCAN)
 
+            checks_done = 0
             for addr in ready:
+                # v6.0.3: bound work per scan so the backlog can't flood us.
+                if checks_done >= MAX_CHECKS_PER_SCAN:
+                    log.info("Hit per-scan check cap (%d); rest wait for next scan",
+                             MAX_CHECKS_PER_SCAN)
+                    break
+
                 if addr in alerted or addr in seen:
                     pending.pop(addr, None)
                     continue
 
-                pair = await get_pair_data(session, addr)
+                # v6.0.3 STEP 1 — CHEAP age check: DexScreener only, NO Helius
+                # liquidity fallback. This rejects too-old coins for 1 cheap call
+                # instead of 1 call + a Helius lookup, killing the fallback flood.
+                pair = await get_pair_data(session, addr, skip_liq_fallback=True)
                 if not pair:
                     continue
-
                 created = pair.get("pairCreatedAt", 0) or 0
                 if not created:
                     continue
-
                 age_min = (int(time.time() * 1000) - created) / 60_000
                 sym = (pair.get("baseToken") or {}).get("symbol", addr[:8])
-                log.info("Checking %s - age: %.1fm", sym, age_min)
 
                 if age_min > MAX_AGE_MINUTES:
                     log.info("Skip %s - too old (%.1fm) [blacklisted]", sym, age_min)
                     pending.pop(addr, None)
-                    seen.add(addr)  # v5.9.1: permanently ignore — stops re-entry from source
+                    seen.add(addr)
+                    checks_done += 1
                     continue
                 if age_min < MIN_AGE_MINUTES:
                     log.info("Skip %s - too fresh (%.1fm), keeping for next scan", sym, age_min)
                     continue
+
+                # v6.0.3 STEP 2 — age passed. NOW it's worth the full data
+                # (incl. Helius liquidity fallback) + rugcheck.
+                log.info("Checking %s - age: %.1fm", sym, age_min)
+                checks_done += 1
+                if float((pair.get("liquidity") or {}).get("usd", 0) or 0) == 0:
+                    full = await get_pair_data(session, addr, skip_liq_fallback=False)
+                    if full:
+                        pair = full
 
                 rug_score, risks, holders, deployer = await get_rugcheck(session, addr)
                 is_graduated = await is_pumpfun_graduate(session, addr)
@@ -1556,9 +1594,6 @@ async def scanner_loop(bot, seen, session, portfolio, whales):
                 if not passed:
                     log.info("Filtered: %s - %s", sym, reason)
                     pending.pop(addr, None)
-                    # v5.9.1: blacklist permanent fails so they don't re-enter from source.
-                    # Temporary fails (buy pressure, holder counts) get another chance
-                    # if the coin is still inside the window next scan.
                     permanent = ("no Twitter" in reason or "dev sold" in reason
                                  or "ends in pump" in reason or "too old" in reason
                                  or "clone wallet" in reason)
@@ -1679,7 +1714,7 @@ async def post_init(app):
     mode_str = "PAPER TRADING (no real money)" if PAPER_MODE else "LIVE TRADING"
     try:
         await bot.send_message(chat_id=CHAT_ID, text=(
-            f"Memecoin Quality-Coin Screener v6.0.2 is LIVE\n"
+            f"Memecoin Quality-Coin Screener v6.0.3 is LIVE\n"
             f"Mode: {mode_str}\n\n"
             f"NEW PURPOSE (v6.0):\n"
             f"This is no longer a fresh-launch sniper. It now finds\n"
@@ -1731,7 +1766,7 @@ def main():
         .post_shutdown(post_shutdown)
         .build()
     )
-    log.info("Starting bot v6.0.2...")
+    log.info("Starting bot v6.0.3...")
     app.run_polling(allowed_updates=["message"])
 
 
